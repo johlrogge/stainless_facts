@@ -3,9 +3,12 @@ name = "stainless-facts"
 version = "0.1.0"
 edition = "2024"
 authors = ["Joakim Ohlrogge"]
-license = "MIT"
-description = "Immutable fact stream for building event-sourced systems"
-repository = "https://github.com/johlrogge/stainless-facts"  # if you have one
+license = "MIT OR Apache-2.0"
+description = "A simple, immutable fact stream library inspired by Datomic"
+repository = "https://github.com/johlrogge/stainless-facts"  
+readme = "README.md"
+keywords = ["facts", "event-sourcing", "datomic", "immutable", "schema-evolution"]
+categories = ["data-structures", "database"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -14,3 +17,7 @@ serde_json = "1.0"
 
 [dev-dependencies]
 rstest = "0.26"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
