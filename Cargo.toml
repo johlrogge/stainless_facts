@@ -1,0 +1,15 @@
+[package]
+name = "stainless-facts"
+version = "0.1.0"
+edition = "2024"
+authors = ["Joakim Ohlrogge"]
+license = "MIT"
+description = "Immutable fact stream for building event-sourced systems"
+repository = "https://github.com/johlrogge/stainless-facts"  # if you have one
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+ron = "0.8"
