@@ -1,6 +1,9 @@
+// src/lib.rs
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, hash::Hash};
+use serde_json::Value as JsonValue;
+use std::collections::HashMap;
+use std::hash::Hash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
@@ -43,20 +46,28 @@ impl<E, V, S> Fact<E, V, S> {
     }
 }
 
-// Trait now includes S
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnknownAttribute {
+    pub t: String,
+    pub v: JsonValue,
+}
+
 pub trait FactAggregator<E, V, S> {
     fn assert(&mut self, value: &V, source: &S);
     fn retract(&mut self, value: &V, source: &S);
+
+    // Default implementations that do nothing
+    fn assert_unknown(&mut self, _attribute: &str, _value: &JsonValue, _source: &S) {}
+    fn retract_unknown(&mut self, _attribute: &str, _value: &JsonValue, _source: &S) {}
 }
 
-// Aggregation function updated
 pub fn aggregate_facts<E, V, S, A, I>(facts: I) -> HashMap<E, A>
 where
     E: Eq + Hash + Clone,
     A: FactAggregator<E, V, S> + Default,
     I: IntoIterator<Item = Fact<E, V, S>>,
 {
-    let mut aggregators = HashMap::<E, A>::new();
+    let mut aggregators = HashMap::new();
 
     for fact in facts {
         let aggregator: &mut A = aggregators.entry(fact.entity().clone()).or_default();
@@ -70,58 +81,12 @@ where
     aggregators
 }
 
-// Convenience type aliases
-pub type StringSourceFact<E, V> = Fact<E, V, String>;
-pub type NoSourceFact<E, V> = Fact<E, V, ()>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rstest::rstest;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
-    #[serde(transparent)]
-    struct Bpm(u16);
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    enum TestValue {
-        Bpm(Bpm),
-        Title(String),
-    }
-
-    type TestFact = StringSourceFact<String, TestValue>;
-
-    #[rstest]
-    #[case::string_variant(
-        r#"("some_song", Title("a_title"), "2024-01-15T10:30:00Z", "alice", Assert)"#,
-        Ok(Fact::new(
-            "some_song".to_string(),
-            TestValue::Title("a_title".to_string()),
-            "2024-01-15T10:30:00Z".parse().unwrap(),
-            "alice".to_string(), Operation::Assert)))]
-    #[case::transparent_new_type_variant(
-        r#"("some_song", Bpm(12350), "2024-01-16T10:30:00Z", "alice", Assert)"#,
-        Ok(Fact::new(
-            "some_song".to_string(),
-            TestValue::Bpm(Bpm(12350)),
-            "2024-01-16T10:30:00Z".parse().unwrap(),
-            "alice".to_string(), Operation::Assert)))
-]
-    fn deserialize(
-        #[case] serialized: &str,
-        #[case] expected: Result<TestFact, ron::de::SpannedError>,
-    ) {
-        let actual: Result<TestFact, ron::de::SpannedError> = ron::from_str(serialized);
-        assert_eq!(expected, actual);
-    }
-}
-
-#[cfg(test)]
-mod aggregation_tests {
-    use super::*;
-    use rstest::rstest;
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(transparent)]
     struct Bpm(u16);
 
@@ -130,6 +95,117 @@ mod aggregation_tests {
     struct Tag(String);
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "t", content = "v")]
+    enum TestValue {
+        Bpm(Bpm),
+        Title(String),
+        Tag(Tag),
+    }
+
+    type TestFact = Fact<String, TestValue, String>;
+
+    #[test]
+    fn see_what_json_produces() {
+        let fact = Fact::new(
+            "some_song".to_string(),
+            TestValue::Title("a_title".to_string()),
+            "2024-01-15T10:30:00Z".parse().unwrap(),
+            "alice".to_string(),
+            Operation::Assert,
+        );
+
+        let serialized = serde_json::to_string(&fact).unwrap();
+        println!("JSON produces: {}", serialized);
+
+        // Try round-trip
+        let deserialized: Result<TestFact, _> = serde_json::from_str(&serialized);
+        assert!(deserialized.is_ok());
+    }
+
+    #[rstest]
+    #[case::string_variant(
+        r#"["some_song",{"t":"Title","v":"a_title"},"2024-01-15T10:30:00Z","alice","Assert"]"#,
+        Ok(Fact::new(
+            "some_song".to_string(),
+            TestValue::Title("a_title".to_string()),
+            "2024-01-15T10:30:00Z".parse().unwrap(),
+            "alice".to_string(),
+            Operation::Assert
+        ))
+    )]
+    #[case::transparent_new_type_variant(
+        r#"["some_song",{"t":"Bpm","v":12350},"2024-01-16T10:30:00Z","alice","Assert"]"#,
+        Ok(Fact::new(
+            "some_song".to_string(),
+            TestValue::Bpm(Bpm(12350)),
+            "2024-01-16T10:30:00Z".parse().unwrap(),
+            "alice".to_string(),
+            Operation::Assert
+        ))
+    )]
+    fn deserialize(
+        #[case] serialized: &str,
+        #[case] expected: Result<TestFact, serde_json::Error>,
+    ) {
+        let actual: Result<TestFact, serde_json::Error> = serde_json::from_str(serialized);
+        match actual {
+            Ok(a) => match expected {
+                Ok(e) => assert_eq!(e, a),
+                Err(e) => panic!("got error {e}"),
+            },
+            Err(e) => {
+                if let Ok(a) = expected {
+                    panic!("expected {a:?} but got error {e}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deserialize_unknown_attribute() {
+        let serialized = r#"["some_song",{"t":"NewAttribute","v":"some_value"},"2024-01-15T10:30:00Z","alice","Assert"]"#;
+
+        let result: Result<Fact<String, UnknownAttribute, String>, _> =
+            serde_json::from_str(serialized);
+        assert!(result.is_ok());
+
+        let fact = result.unwrap();
+        assert_eq!(fact.entity(), "some_song");
+        assert_eq!(fact.value().t, "NewAttribute");
+        assert_eq!(fact.value().v, JsonValue::String("some_value".to_string()));
+    }
+
+    #[test]
+    fn deserialize_unknown_attribute_with_number() {
+        let serialized =
+            r#"["some_song",{"t":"NewAttribute","v":42},"2024-01-15T10:30:00Z","alice","Assert"]"#;
+
+        let result: Result<Fact<String, UnknownAttribute, String>, _> =
+            serde_json::from_str(serialized);
+        assert!(result.is_ok());
+
+        let fact = result.unwrap();
+        assert_eq!(fact.entity(), "some_song");
+        assert_eq!(fact.value().t, "NewAttribute");
+        assert_eq!(fact.value().v, JsonValue::Number(42.into()));
+    }
+}
+
+#[cfg(test)]
+mod aggregation_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct Bpm(u16);
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct Tag(String);
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "t", content = "v")]
     enum TestValue {
         Bpm(Bpm),
         Title(String),
@@ -141,6 +217,7 @@ mod aggregation_tests {
         bpm: Option<Bpm>,
         title: Option<String>,
         tags: Vec<Tag>,
+        unknown_attributes: HashMap<String, JsonValue>,
     }
 
     impl FactAggregator<String, TestValue, String> for TestAggregation {
@@ -172,6 +249,15 @@ mod aggregation_tests {
                     self.tags.retain(|t| t != tag);
                 }
             }
+        }
+
+        fn assert_unknown(&mut self, attribute: &str, value: &JsonValue, _source: &String) {
+            self.unknown_attributes
+                .insert(attribute.to_string(), value.clone());
+        }
+
+        fn retract_unknown(&mut self, attribute: &str, _value: &JsonValue, _source: &String) {
+            self.unknown_attributes.remove(attribute);
         }
     }
 
@@ -215,7 +301,7 @@ mod aggregation_tests {
         {
             let mut expected = HashMap::new();
             expected.insert("track1".to_string(), TestAggregation {
-                bpm: Some(Bpm(13000)), // Latest wins
+                bpm: Some(Bpm(13000)),
                 ..Default::default()
             });
             expected

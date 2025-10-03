@@ -10,7 +10,7 @@ repository = "https://github.com/johlrogge/stainless-facts"  # if you have one
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1.0"
 
 [dev-dependencies]
-ron = "0.8"
 rstest = "0.26"
