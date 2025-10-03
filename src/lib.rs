@@ -1,35 +1,47 @@
+use chrono::{DateTime, Utc};
+// src/lib.rs
 use serde::{Deserialize, Serialize};
 
-/// Whether a fact asserts or retracts a value
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
     Assert,
     Retract,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fact<E, V>(E, V, DateTime<Utc>, String, Operation);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn operation_serializes_to_ron() {
-        let op = Operation::Assert;
-        let ron = ron::to_string(&op).unwrap();
-        assert_eq!(ron, "Assert");
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct Bpm(u16);
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    // #[serde(tag = "t", content = "d")]
+    enum TestValue {
+        Bpm(Bpm),
+        Title(String),
     }
 
-    #[test]
-    fn operation_deserializes_from_ron() {
-        let ron = "Retract";
-        let op: Operation = ron::from_str(ron).unwrap();
-        assert_eq!(op, Operation::Retract);
-    }
+    type TestFact = Fact<String, TestValue>;
 
-    #[test]
-    fn operation_round_trips() {
-        let original = Operation::Assert;
-        let serialized = ron::to_string(&original).unwrap();
-        let deserialized: Operation = ron::from_str(&serialized).unwrap();
-        assert_eq!(original, deserialized);
+    #[rstest]
+    #[case::test_numeric(
+        r#"("some_song", Title("a_title"), "2024-01-15T10:30:00Z", "alice", Assert)"#,
+        Ok(Fact(
+            "some_song".to_string(),
+            TestValue::Title("a_title".to_string()),
+            "2024-01-15T10:30:00Z".parse().unwrap(),
+            "alice".to_string(), Operation::Assert)))
+]
+    fn deserialize(
+        #[case] serialized: &str,
+        #[case] expected: Result<TestFact, ron::de::SpannedError>,
+    ) {
+        let actual: Result<TestFact, ron::de::SpannedError> = ron::from_str(serialized);
+        assert_eq!(expected, actual);
     }
 }
