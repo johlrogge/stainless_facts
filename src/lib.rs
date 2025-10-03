@@ -1,7 +1,6 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, hash::Hash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
@@ -10,14 +9,14 @@ pub enum Operation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Fact<E, V>(E, V, DateTime<Utc>, String, Operation);
+pub struct Fact<E, V, S>(E, V, DateTime<Utc>, S, Operation);
 
-impl<E, V> Fact<E, V> {
+impl<E, V, S> Fact<E, V, S> {
     pub fn new(
         entity: E,
         value: V,
         timestamp: DateTime<Utc>,
-        source: String,
+        source: S,
         operation: Operation,
     ) -> Self {
         Self(entity, value, timestamp, source, operation)
@@ -35,7 +34,7 @@ impl<E, V> Fact<E, V> {
         &self.2
     }
 
-    pub fn source(&self) -> &str {
+    pub fn source(&self) -> &S {
         &self.3
     }
 
@@ -44,29 +43,36 @@ impl<E, V> Fact<E, V> {
     }
 }
 
-// The trait
-pub trait FactAggregator<E, V> {
-    fn add_fact(&mut self, fact: &Fact<E, V>);
+// Trait now includes S
+pub trait FactAggregator<E, V, S> {
+    fn assert(&mut self, value: &V, source: &S);
+    fn retract(&mut self, value: &V, source: &S);
 }
 
-// The aggregation function
-pub fn aggregate_facts<E, V, A, I>(facts: I) -> HashMap<E, A>
+// Aggregation function updated
+pub fn aggregate_facts<E, V, S, A, I>(facts: I) -> HashMap<E, A>
 where
-    E: Eq + std::hash::Hash + Clone,
-    A: FactAggregator<E, V> + Default,
-    I: IntoIterator<Item = Fact<E, V>>,
+    E: Eq + Hash + Clone,
+    A: FactAggregator<E, V, S> + Default,
+    I: IntoIterator<Item = Fact<E, V, S>>,
 {
-    let mut aggregators: HashMap<E, A> = HashMap::new();
+    let mut aggregators = HashMap::<E, A>::new();
 
     for fact in facts {
-        aggregators
-            .entry(fact.entity().clone())
-            .or_default()
-            .add_fact(&fact);
+        let aggregator: &mut A = aggregators.entry(fact.entity().clone()).or_default();
+
+        match fact.operation() {
+            Operation::Assert => aggregator.assert(fact.value(), fact.source()),
+            Operation::Retract => aggregator.retract(fact.value(), fact.source()),
+        }
     }
 
     aggregators
 }
+
+// Convenience type aliases
+pub type StringSourceFact<E, V> = Fact<E, V, String>;
+pub type NoSourceFact<E, V> = Fact<E, V, ()>;
 
 #[cfg(test)]
 mod tests {
@@ -83,7 +89,7 @@ mod tests {
         Title(String),
     }
 
-    type TestFact = Fact<String, TestValue>;
+    type TestFact = StringSourceFact<String, TestValue>;
 
     #[rstest]
     #[case::string_variant(
