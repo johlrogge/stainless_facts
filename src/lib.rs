@@ -9,14 +9,63 @@
 //! represents a single assertion or retraction about an entity's attribute at a
 //! specific point in time.
 //!
+//! ## Serialization Contract
+//!
+//! **IMPORTANT**: Your value enum must use serde's adjacently tagged representation:
+//!
+//! ```rust
+//! # use serde::{Serialize, Deserialize};
+//! #[derive(Serialize, Deserialize)]
+//! #[serde(tag = "t", content = "v")]  // Required!
+//! enum MyValue {
+//!     Bpm(u16),
+//!     Title(String),
+//! }
+//! ```
+//!
+//! This produces the JSON format the fact stream expects:
+//! ```json
+//! {"t": "Bpm", "v": 12800}
+//! ```
+//!
+//! Use the [`assert_fact_value_format!`] macro to validate your types at compile time.
+//!
+//! ## Common Mistakes
+//!
+//! ❌ **Wrong - will fail validation:**
+//! ```should_panic
+//! # use serde::{Serialize, Deserialize};
+//! # use stainless_facts::assert_fact_value_format;
+//! #[derive(Serialize, Deserialize)]
+//! enum MyValue {
+//!     Bpm(u16),  // Serializes as {"Bpm": 12800} - WRONG!
+//! }
+//!
+//! assert_fact_value_format!(MyValue::Bpm(12800));  // This will panic!
+//! ```
+//!
+//! ✅ **Correct - uses adjacently tagged format:**
+//! ```rust
+//! # use serde::{Serialize, Deserialize};
+//! # use stainless_facts::assert_fact_value_format;
+//! #[derive(Serialize, Deserialize)]
+//! #[serde(tag = "t", content = "v")]
+//! enum MyValue {
+//!     Bpm(u16),  // Serializes as {"t": "Bpm", "v": 12800} - CORRECT!
+//! }
+//!
+//! // Validates the format:
+//! assert_fact_value_format!(MyValue::Bpm(12800));
+//! ```
+//!
 //! ## Quick Example
 //!
 //! ```rust
-//! use stainless_facts::{Fact, Operation, FactAggregator, aggregate_facts};
+//! use stainless_facts::{Fact, Operation, FactAggregator, aggregate_facts, assert_fact_value_format};
 //! use serde::{Serialize, Deserialize};
 //! use std::collections::HashMap;
 //!
-//! // Define your value types
+//! // Define your value types with the required format
 //! #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 //! #[serde(tag = "t", content = "v")]
 //! enum MusicValue {
@@ -24,6 +73,10 @@
 //!     Title(String),
 //!     Tag(String),
 //! }
+//!
+//! // Validate the format
+//! assert_fact_value_format!(MusicValue::Bpm(12800));
+//! assert_fact_value_format!(MusicValue::Title("Test".to_string()));
 //!
 //! // Define your aggregation structure
 //! #[derive(Default, Debug)]
@@ -96,15 +149,19 @@
 //! Use [`aggregate_facts`] when your aggregator is the final result:
 //!
 //! ```rust
-//! # use stainless_facts::{Fact, Operation, FactAggregator, aggregate_facts};
+//! # use stainless_facts::{Fact, Operation, FactAggregator, aggregate_facts, assert_fact_value_format};
 //! # use serde::{Serialize, Deserialize};
 //! # use std::collections::HashMap;
-//! # #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-//! # #[serde(tag = "t", content = "v")]
-//! # enum MusicValue { Bpm(u16) }
+//! #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+//! #[serde(tag = "t", content = "v")]
+//! enum MusicValue { Bpm(u16) }
+//!
+//! // Validate format
+//! assert_fact_value_format!(MusicValue::Bpm(12800));
+//!
 //! #[derive(Default)]
 //! struct Track {
-//!     bpm: Option<u16>,  // Optional fields
+//!     bpm: Option<u16>,  // Optional fields - no validation
 //! }
 //!
 //! # impl FactAggregator<String, MusicValue, String> for Track {
@@ -116,57 +173,72 @@
 //! let tracks: HashMap<String, Track> = aggregate_facts(vec![]);
 //! ```
 //!
-//! ### Builder Pattern with Validation
+//! ### Builder Pattern with Zero-Copy Aggregation
 //!
-//! Use [`aggregate_and_build`] with the [`Buildable`] trait for validated results:
+//! Use [`aggregate_and_build`] with the [`Buildable`] trait for **zero-copy aggregation**
+//! with validated results. The builder borrows data during fact processing, and only
+//! clones it when producing the final validated output:
 //!
 //! ```rust
-//! # use stainless_facts::{Fact, Operation, FactAggregator, Buildable, aggregate_and_build};
+//! # use stainless_facts::{Fact, Operation, FactAggregator, Buildable, aggregate_and_build, assert_fact_value_format};
 //! # use serde::{Serialize, Deserialize};
 //! # use std::collections::HashMap;
-//! # #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-//! # #[serde(tag = "t", content = "v")]
-//! # enum MusicValue { Bpm(u16) }
+//! # use std::borrow::Cow;
+//! #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+//! #[serde(tag = "t", content = "v")]
+//! enum MusicValue<'a> {
+//!     #[serde(borrow)]
+//!     Title(Cow<'a, str>),
+//! }
+//!
+//! // Validate format
+//! assert_fact_value_format!(MusicValue::Title(Cow::Borrowed("test")));
+//!
 //! #[derive(Default)]
-//! struct TrackBuilder {
-//!     bpm: Option<u16>,
+//! struct TrackBuilder<'a> {
+//!     title: Option<Cow<'a, str>>,  // Borrows during aggregation
 //! }
 //!
 //! struct Track {
-//!     bpm: u16,  // Required! No Option
+//!     title: String,  // Required! Owns after building
 //! }
 //!
 //! # #[derive(Debug)]
-//! # enum BuildError { MissingBpm }
+//! # enum BuildError { MissingTitle }
 //! # impl std::fmt::Display for BuildError {
 //! #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//! #         write!(f, "missing bpm")
+//! #         write!(f, "missing title")
 //! #     }
 //! # }
 //! # impl std::error::Error for BuildError {}
-//! # impl FactAggregator<String, MusicValue, String> for TrackBuilder {
-//! #     fn assert(&mut self, value: &MusicValue, _source: &String) {
-//! #         match value { MusicValue::Bpm(bpm) => self.bpm = Some(*bpm) }
+//! # impl<'a> FactAggregator<String, MusicValue<'a>, String> for TrackBuilder<'a> {
+//! #     fn assert(&mut self, value: &MusicValue<'a>, _source: &String) {
+//! #         match value { MusicValue::Title(title) => self.title = Some(title.clone()) }
 //! #     }
 //! #     fn retract(&mut self, _value: &MusicValue, _source: &String) {}
 //! # }
-//! impl Buildable for TrackBuilder {
+//! impl<'a> Buildable for TrackBuilder<'a> {
 //!     type Output = Track;
 //!     type Error = BuildError;
 //!     
 //!     fn build(self) -> Result<Track, BuildError> {
 //!         Ok(Track {
-//!             bpm: self.bpm.ok_or(BuildError::MissingBpm)?,
+//!             title: self.title.ok_or(BuildError::MissingTitle)?.into_owned(),  // Clone only here
 //!         })
 //!     }
 //! }
 //!
-//! // Fails fast on validation error
+//! // Zero-copy during aggregation, validation on build
 //! match aggregate_and_build::<_, _, _, TrackBuilder, _>(vec![]) {
 //!     Ok(tracks) => println!("Built {} tracks", tracks.len()),
 //!     Err(e) => eprintln!("Build failed: {}", e),
 //! }
 //! ```
+//!
+//! **Key benefits:**
+//! - **Zero allocations during aggregation**: Borrows with `Cow<'a, str>`
+//! - **Validation**: Required fields enforced at build time
+//! - **Single clone**: Data cloned only once when building final output
 //!
 //! ## Key Features
 //!
@@ -200,11 +272,56 @@ pub enum Operation {
     Retract,
 }
 
+/// Validates at compile-time that a value uses the correct serde format for facts.
+///
+/// This macro checks that your value serializes with the adjacently-tagged representation
+/// required by the fact stream format: `{"t": "VariantName", "v": value}`.
+///
+/// # Examples
+///
+/// ```
+/// # use stainless_facts::assert_fact_value_format;
+/// # use serde::{Serialize, Deserialize};
+/// #[derive(Serialize, Deserialize)]
+/// #[serde(tag = "t", content = "v")]
+/// enum MyValue {
+///     Count(u32),
+/// }
+///
+/// // Validates the format at compile time
+/// assert_fact_value_format!(MyValue::Count(42));
+/// ```
+///
+/// # What it checks
+///
+/// - The serialized JSON has a "t" field (the tag)
+/// - The serialized JSON has a "v" field (the content)
+/// - Both fields are at the top level
+///
+/// # Panics
+///
+/// Panics at compile time if the value doesn't serialize with the correct format.
+/// The panic message will tell you to add `#[serde(tag = "t", content = "v")]` to your enum.
+#[macro_export]
+macro_rules! assert_fact_value_format {
+    ($value:expr) => {{
+        let json = serde_json::to_value(&$value).expect("Failed to serialize value");
+        assert!(
+            json.get("t").is_some(),
+            "Value must serialize with a 't' (tag) field. Add #[serde(tag = \"t\", content = \"v\")] to your enum."
+        );
+        assert!(
+            json.get("v").is_some(),
+            "Value must serialize with a 'v' (content) field. Add #[serde(tag = \"t\", content = \"v\")] to your enum."
+        );
+    }};
+}
+
 /// An immutable fact about an entity.
 ///
 /// A fact consists of five components:
 /// - **Entity** (`E`): The identifier of what the fact is about
-/// - **Value** (`V`): The attribute and its value
+/// - **Value** (`V`): The attribute and its value (must use `#[serde(tag = "t", content = "v")]`)
 /// - **Timestamp**: When this fact was recorded
 /// - **Source** (`S`): Who or what created this fact
 /// - **Operation**: Whether this is an assertion or retraction
@@ -212,13 +329,13 @@ pub enum Operation {
 /// # Type Parameters
 ///
 /// - `E`: Entity type (commonly `String` for IDs)
-/// - `V`: Value type (your domain-specific enum)
+/// - `V`: Value type (your domain-specific enum with `#[serde(tag = "t", content = "v")]`)
 /// - `S`: Source type (commonly `String` for usernames, or `()` if not tracked)
 ///
 /// # Examples
 ///
 /// ```
-/// use stainless_facts::{Fact, Operation};
+/// use stainless_facts::{Fact, Operation, assert_fact_value_format};
 /// use serde::{Serialize, Deserialize};
 ///
 /// #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +344,9 @@ pub enum Operation {
 ///     Name(String),
 ///     Age(u32),
 /// }
+///
+/// // Validate format
+/// assert_fact_value_format!(MyValue::Name("Alice".to_string()));
 ///
 /// let fact = Fact::new(
 ///     "person1".to_string(),
@@ -329,7 +449,7 @@ pub struct UnknownAttribute {
 /// # Type Parameters
 ///
 /// - `E`: Entity type
-/// - `V`: Value type (your domain enum)
+/// - `V`: Value type (your domain enum with `#[serde(tag = "t", content = "v")]`)
 /// - `S`: Source type
 ///
 /// # Cardinality Patterns
@@ -337,11 +457,15 @@ pub struct UnknownAttribute {
 /// ## Single-Valued (Latest Wins)
 ///
 /// ```
-/// # use stainless_facts::FactAggregator;
+/// # use stainless_facts::{FactAggregator, assert_fact_value_format};
 /// # use serde::{Serialize, Deserialize};
-/// # #[derive(Clone, Serialize, Deserialize)]
-/// # #[serde(tag = "t", content = "v")]
-/// # enum MyValue { Age(u32) }
+/// #[derive(Clone, Serialize, Deserialize)]
+/// #[serde(tag = "t", content = "v")]
+/// enum MyValue { Age(u32) }
+///
+/// // Validate format
+/// assert_fact_value_format!(MyValue::Age(42));
+///
 /// # struct Person { age: Option<u32> }
 /// impl FactAggregator<String, MyValue, String> for Person {
 ///     fn assert(&mut self, value: &MyValue, _source: &String) {
@@ -361,11 +485,15 @@ pub struct UnknownAttribute {
 /// ## Multi-Valued (Accumulates)
 ///
 /// ```
-/// # use stainless_facts::FactAggregator;
+/// # use stainless_facts::{FactAggregator, assert_fact_value_format};
 /// # use serde::{Serialize, Deserialize};
-/// # #[derive(Clone, PartialEq, Serialize, Deserialize)]
-/// # #[serde(tag = "t", content = "v")]
-/// # enum MyValue { Tag(String) }
+/// #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// #[serde(tag = "t", content = "v")]
+/// enum MyValue { Tag(String) }
+///
+/// // Validate format
+/// assert_fact_value_format!(MyValue::Tag("test".to_string()));
+///
 /// # struct Item { tags: Vec<String> }
 /// impl FactAggregator<String, MyValue, String> for Item {
 ///     fn assert(&mut self, value: &MyValue, _source: &String) {
@@ -409,13 +537,17 @@ pub trait FactAggregator<E, V, S> {
     /// # Examples
     ///
     /// ```
-    /// # use stainless_facts::FactAggregator;
+    /// # use stainless_facts::{FactAggregator, assert_fact_value_format};
     /// # use serde::{Serialize, Deserialize};
     /// # use serde_json::Value as JsonValue;
     /// # use std::collections::HashMap;
-    /// # #[derive(Clone, Serialize, Deserialize)]
-    /// # #[serde(tag = "t", content = "v")]
-    /// # enum MyValue { Name(String) }
+    /// #[derive(Clone, Serialize, Deserialize)]
+    /// #[serde(tag = "t", content = "v")]
+    /// enum MyValue { Name(String) }
+    ///
+    /// // Validate format
+    /// assert_fact_value_format!(MyValue::Name("test".to_string()));
+    ///
     /// # struct Entity { name: Option<String>, unknowns: HashMap<String, JsonValue> }
     /// impl FactAggregator<String, MyValue, String> for Entity {
     ///     fn assert(&mut self, value: &MyValue, _source: &String) {
@@ -448,7 +580,7 @@ pub trait FactAggregator<E, V, S> {
 /// # Type Parameters
 ///
 /// - `E`: Entity type (must be hashable and cloneable)
-/// - `V`: Value type
+/// - `V`: Value type (must use `#[serde(tag = "t", content = "v")]`)
 /// - `S`: Source type
 /// - `A`: Aggregator type (must implement `FactAggregator` and `Default`)
 /// - `I`: Iterator type yielding facts
@@ -456,7 +588,7 @@ pub trait FactAggregator<E, V, S> {
 /// # Examples
 ///
 /// ```
-/// use stainless_facts::{Fact, Operation, FactAggregator, aggregate_facts};
+/// use stainless_facts::{Fact, Operation, FactAggregator, aggregate_facts, assert_fact_value_format};
 /// use serde::{Serialize, Deserialize};
 /// use std::collections::HashMap;
 ///
@@ -465,6 +597,9 @@ pub trait FactAggregator<E, V, S> {
 /// enum Value {
 ///     Count(u32),
 /// }
+///
+/// // Validate format
+/// assert_fact_value_format!(Value::Count(5));
 ///
 /// #[derive(Default)]
 /// struct Counter {
@@ -512,28 +647,50 @@ where
     aggregators
 }
 
+/// Trait for builders that can produce a final validated output.
+///
+/// This trait enables the builder pattern for fact aggregation, where the aggregator
+/// acts as a builder that accumulates state, and `build()` validates and produces
+/// the final result.
+///
+/// # Type Parameters
+///
+/// - `Output`: The final validated type (e.g., a struct with required fields)
+/// - `Error`: Error type when validation fails
+///
+/// # Zero-Copy Pattern
+///
+/// The builder pattern enables zero-copy aggregation: the builder can borrow
+/// data during fact processing, and only clone it when producing the final output.
+///
 /// # Examples
 ///
 /// ```
-/// use stainless_facts::{FactAggregator, Buildable};
+/// use stainless_facts::{FactAggregator, Buildable, assert_fact_value_format};
 /// use serde::{Serialize, Deserialize};
+/// use std::borrow::Cow;
 ///
 /// #[derive(Clone, Serialize, Deserialize)]
 /// #[serde(tag = "t", content = "v")]
-/// enum MusicValue {
+/// enum MusicValue<'a> {
 ///     Bpm(u16),
-///     Title(String),
+///     #[serde(borrow)]
+///     Title(Cow<'a, str>),
 /// }
 ///
+/// // Validate format
+/// assert_fact_value_format!(MusicValue::<'static>::Bpm(12800));
+/// assert_fact_value_format!(MusicValue::Title(Cow::Borrowed("test")));
+///
 /// #[derive(Default)]
-/// struct TrackBuilder {
+/// struct TrackBuilder<'a> {
 ///     bpm: Option<u16>,
-///     title: Option<String>,
+///     title: Option<Cow<'a, str>>,  // Borrows during aggregation
 /// }
 ///
 /// struct Track {
 ///     bpm: u16,
-///     title: String,
+///     title: String,  // Owns after building
 /// }
 ///
 /// #[derive(Debug)]
@@ -553,24 +710,24 @@ where
 ///
 /// impl std::error::Error for BuildError {}
 ///
-/// impl FactAggregator<String, MusicValue, String> for TrackBuilder {
-///     fn assert(&mut self, value: &MusicValue, _source: &String) {
+/// impl<'a> FactAggregator<String, MusicValue<'a>, String> for TrackBuilder<'a> {
+///     fn assert(&mut self, value: &MusicValue<'a>, _source: &String) {
 ///         match value {
 ///             MusicValue::Bpm(bpm) => self.bpm = Some(*bpm),
-///             MusicValue::Title(title) => self.title = Some(title.clone()),
+///             MusicValue::Title(title) => self.title = Some(title.clone()),  // Cheap Cow clone
 ///         }
 ///     }
 ///     fn retract(&mut self, _value: &MusicValue, _source: &String) {}
 /// }
 ///
-/// impl Buildable for TrackBuilder {
+/// impl<'a> Buildable for TrackBuilder<'a> {
 ///     type Output = Track;
 ///     type Error = BuildError;
 ///     
 ///     fn build(self) -> Result<Track, BuildError> {
 ///         Ok(Track {
 ///             bpm: self.bpm.ok_or(BuildError::MissingBpm)?,
-///             title: self.title.ok_or(BuildError::MissingTitle)?,
+///             title: self.title.ok_or(BuildError::MissingTitle)?.into_owned(),  // Clone only here
 ///         })
 ///     }
 /// }
@@ -629,25 +786,59 @@ where
     }
 }
 
+/// Aggregate facts and build final validated results.
+///
+/// This function processes facts in order, applying each to the appropriate entity's
+/// aggregator (builder). After all facts are processed, it calls `build()` on each
+/// aggregator to produce validated final results.
+///
+/// Unlike [`aggregate_facts`], this function:
+/// - Tracks the fact index for each entity
+/// - Calls `build()` to validate and produce final output
+/// - Returns detailed error information on validation failure
+///
+/// # Type Parameters
+///
+/// - `E`: Entity type (must be hashable and cloneable)
+/// - `V`: Value type (must use `#[serde(tag = "t", content = "v")]`)
+/// - `S`: Source type
+/// - `A`: Aggregator/Builder type (must implement both `FactAggregator` and `Buildable`)
+/// - `I`: Iterator type yielding facts
+///
+/// # Errors
+///
+/// Returns [`AggregateError`] containing:
+/// - The entity that failed
+/// - The index of the last fact processed for that entity
+/// - The builder's validation error
+///
 /// # Examples
 ///
+/// This example demonstrates zero-copy aggregation: the builder borrows strings
+/// during fact processing, and only clones them when building the final output.
+///
 /// ```
-/// use stainless_facts::{Fact, Operation, FactAggregator, Buildable, aggregate_and_build};
+/// use stainless_facts::{Fact, Operation, FactAggregator, Buildable, aggregate_and_build, assert_fact_value_format};
 /// use serde::{Serialize, Deserialize};
+/// use std::borrow::Cow;
 ///
 /// #[derive(Clone, Serialize, Deserialize)]
 /// #[serde(tag = "t", content = "v")]
-/// enum Value {
-///     Name(String),
+/// enum Value<'a> {
+///     #[serde(borrow)]
+///     Name(Cow<'a, str>),
 /// }
 ///
+/// // Validate format
+/// assert_fact_value_format!(Value::Name(Cow::Borrowed("test")));
+///
 /// #[derive(Default)]
-/// struct PersonBuilder {
-///     name: Option<String>,
+/// struct PersonBuilder<'a> {
+///     name: Option<Cow<'a, str>>,  // Borrows during aggregation
 /// }
 ///
 /// struct Person {
-///     name: String,
+///     name: String,  // Owns after building
 /// }
 ///
 /// #[derive(Debug)]
@@ -665,28 +856,28 @@ where
 ///
 /// impl std::error::Error for BuildError {}
 ///
-/// impl FactAggregator<String, Value, ()> for PersonBuilder {
-///     fn assert(&mut self, value: &Value, _source: &()) {
+/// impl<'a> FactAggregator<String, Value<'a>, ()> for PersonBuilder<'a> {
+///     fn assert(&mut self, value: &Value<'a>, _source: &()) {
 ///         match value {
-///             Value::Name(name) => self.name = Some(name.clone()),
+///             Value::Name(name) => self.name = Some(name.clone()),  // Cheap Cow clone
 ///         }
 ///     }
 ///     fn retract(&mut self, _value: &Value, _source: &()) {}
 /// }
 ///
-/// impl Buildable for PersonBuilder {
+/// impl<'a> Buildable for PersonBuilder<'a> {
 ///     type Output = Person;
 ///     type Error = BuildError;
 ///     
 ///     fn build(self) -> Result<Person, BuildError> {
 ///         Ok(Person {
-///             name: self.name.ok_or(BuildError::MissingName)?,
+///             name: self.name.ok_or(BuildError::MissingName)?.into_owned(),  // Clone only here
 ///         })
 ///     }
 /// }
 ///
 /// let facts = vec![
-///     Fact::new("p1".to_string(), Value::Name("Alice".to_string()),
+///     Fact::new("p1".to_string(), Value::Name(Cow::Borrowed("Alice")),
 ///               "2024-01-15T10:00:00Z".parse().unwrap(), (), Operation::Assert),
 /// ];
 ///
@@ -783,6 +974,13 @@ mod tests {
         // Try round-trip
         let deserialized: Result<TestFact, _> = serde_json::from_str(&serialized);
         assert!(deserialized.is_ok());
+    }
+
+    #[test]
+    fn validate_test_value_format() {
+        assert_fact_value_format!(TestValue::Bpm(Bpm(12800)));
+        assert_fact_value_format!(TestValue::Title("test".to_string()));
+        assert_fact_value_format!(TestValue::Tag(Tag("techno".to_string())));
     }
 
     #[rstest]
