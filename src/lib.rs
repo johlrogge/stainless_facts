@@ -213,7 +213,7 @@
 //! # impl std::error::Error for BuildError {}
 //! # impl<'a> FactAggregator<String, MusicValue<'a>, String> for TrackBuilder<'a> {
 //! #     fn assert(&mut self, value: &MusicValue<'a>, _source: &String) {
-//! #         match value { MusicValue::Title(title) => self.title = Some(title.clone()) }
+//! #         match value { MusicValue::Title(title) => self.title = Some(title.into()) }
 //! #     }
 //! #     fn retract(&mut self, _value: &MusicValue, _source: &String) {}
 //! # }
@@ -647,88 +647,77 @@ where
     aggregators
 }
 
-/// Trait for builders that can produce a final validated output.
-///
-/// This trait enables the builder pattern for fact aggregation, where the aggregator
-/// acts as a builder that accumulates state, and `build()` validates and produces
-/// the final result.
-///
-/// # Type Parameters
-///
-/// - `Output`: The final validated type (e.g., a struct with required fields)
-/// - `Error`: Error type when validation fails
-///
-/// # Zero-Copy Pattern
-///
-/// The builder pattern enables zero-copy aggregation: the builder can borrow
-/// data during fact processing, and only clone it when producing the final output.
-///
-/// # Examples
-///
 /// ```
-/// use stainless_facts::{FactAggregator, Buildable, assert_fact_value_format};
+/// use stainless_facts::{Fact, Operation, FactAggregator, Buildable, aggregate_and_build, assert_fact_value_format};
 /// use serde::{Serialize, Deserialize};
 /// use std::borrow::Cow;
 ///
 /// #[derive(Clone, Serialize, Deserialize)]
 /// #[serde(tag = "t", content = "v")]
-/// enum MusicValue<'a> {
-///     Bpm(u16),
+/// enum Value<'a> {
 ///     #[serde(borrow)]
-///     Title(Cow<'a, str>),
+///     Name(Cow<'a, str>),
 /// }
 ///
 /// // Validate format
-/// assert_fact_value_format!(MusicValue::<'static>::Bpm(12800));
-/// assert_fact_value_format!(MusicValue::Title(Cow::Borrowed("test")));
+/// assert_fact_value_format!(Value::Name(Cow::Borrowed("test")));
 ///
 /// #[derive(Default)]
-/// struct TrackBuilder<'a> {
-///     bpm: Option<u16>,
-///     title: Option<Cow<'a, str>>,  // Borrows during aggregation
+/// struct PersonBuilder<'a> {
+///     name: Option<Cow<'a, str>>,  // Borrows during aggregation
 /// }
 ///
-/// struct Track {
-///     bpm: u16,
-///     title: String,  // Owns after building
+/// struct Person {
+///     name: String,  // Owns after building
 /// }
 ///
 /// #[derive(Debug)]
 /// enum BuildError {
-///     MissingBpm,
-///     MissingTitle,
+///     MissingName,
 /// }
 ///
 /// impl std::fmt::Display for BuildError {
 ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 ///         match self {
-///             BuildError::MissingBpm => write!(f, "missing bpm"),
-///             BuildError::MissingTitle => write!(f, "missing title"),
+///             BuildError::MissingName => write!(f, "missing name"),
 ///         }
 ///     }
 /// }
 ///
 /// impl std::error::Error for BuildError {}
 ///
-/// impl<'a> FactAggregator<String, MusicValue<'a>, String> for TrackBuilder<'a> {
-///     fn assert(&mut self, value: &MusicValue<'a>, _source: &String) {
+/// impl<'a> FactAggregator<String, Value<'a>, ()> for PersonBuilder<'a> {
+///     fn assert(&mut self, value: &Value<'a>, _source: &()) {
 ///         match value {
-///             MusicValue::Bpm(bpm) => self.bpm = Some(*bpm),
-///             MusicValue::Title(title) => self.title = Some(title.clone()),  // Cheap Cow clone
+///             Value::Name(name) => self.name = Some(name.clone()),  // Cheap Cow clone
 ///         }
 ///     }
-///     fn retract(&mut self, _value: &MusicValue, _source: &String) {}
+///     fn retract(&mut self, _value: &Value, _source: &()) {}
 /// }
 ///
-/// impl<'a> Buildable for TrackBuilder<'a> {
-///     type Output = Track;
+/// impl<'a> Buildable for PersonBuilder<'a> {
+///     type Output = Person;
 ///     type Error = BuildError;
 ///     
-///     fn build(self) -> Result<Track, BuildError> {
-///         Ok(Track {
-///             bpm: self.bpm.ok_or(BuildError::MissingBpm)?,
-///             title: self.title.ok_or(BuildError::MissingTitle)?.into_owned(),  // Clone only here
+///     fn build(self) -> Result<Person, BuildError> {
+///         Ok(Person {
+///             name: self.name.ok_or(BuildError::MissingName)?.into_owned(),  // Clone only here
 ///         })
+///     }
+/// }
+///
+/// let facts = vec![
+///     Fact::new("p1".to_string(), Value::Name(Cow::Borrowed("Alice")),
+///               "2024-01-15T10:00:00Z".parse().unwrap(), (), Operation::Assert),
+/// ];
+///
+/// match aggregate_and_build::<_, _, _, PersonBuilder, _>(facts) {
+///     Ok(people) => {
+///         let alice = people.get("p1").unwrap();
+///         assert_eq!(alice.name, "Alice");
+///     }
+///     Err(e) => {
+///         eprintln!("Build failed: {}", e);
 ///     }
 /// }
 /// ```
