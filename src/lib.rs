@@ -213,7 +213,7 @@
 //! # impl std::error::Error for BuildError {}
 //! # impl<'a> FactAggregator<String, MusicValue<'a>, String> for TrackBuilder<'a> {
 //! #     fn assert(&mut self, value: &MusicValue<'a>, _source: &String) {
-//! #         match value { MusicValue::Title(title) => self.title = Some(title.into()) }
+//! #         match value { MusicValue::Title(title) => self.title = Some(title.clone()) }
 //! #     }
 //! #     fn retract(&mut self, _value: &MusicValue, _source: &String) {}
 //! # }
@@ -247,6 +247,8 @@
 //! - **Time Travel**: Query historical state by filtering facts
 //! - **Immutable**: Facts are never modified, only appended
 //! - **Type Safe**: Leverages Rust's type system
+
+pub mod io;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

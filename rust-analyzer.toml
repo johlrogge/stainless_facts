@@ -1,0 +1,5 @@
+[cargo]
+features = ["tokio"]
+
+[check]
+allTargets = true
