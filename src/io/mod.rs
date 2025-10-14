@@ -1,16 +1,19 @@
+// src/io/mod.rs
+//
+// Sync I/O always available, async I/O with tokio feature
+
 mod common;
 
-#[cfg(not(feature = "tokio"))]
+// Sync I/O - always available
 mod sync;
-#[cfg(not(feature = "tokio"))]
 pub use sync::{FactStreamReader, FactStreamWriter};
 
+// Async I/O - only with tokio feature
 #[cfg(feature = "tokio")]
 mod asyncio;
+
 #[cfg(feature = "tokio")]
-pub use asyncio::{
-    AsyncFactStreamReader as FactStreamReader, AsyncFactStreamWriter as FactStreamWriter,
-};
+pub use asyncio::{AsyncFactStreamReader, AsyncFactStreamWriter};
 
 use std::time::Duration;
 use thiserror::Error;

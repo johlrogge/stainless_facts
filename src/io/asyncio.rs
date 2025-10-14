@@ -1,10 +1,7 @@
-#![cfg(feature = "tokio")]
-
-// stainless_facts/src/io/asyncio.rs
-use super::{ReadError, WriteError, common};
+use super::{common, ReadError, WriteError};
 use crate::Fact;
 use fs2::FileExt;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::fs::File;

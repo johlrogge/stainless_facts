@@ -1,31 +1,35 @@
 [package]
 name = "stainless-facts"
-version = "0.1.0"
-edition = "2024"
+version = "0.2.0"
+edition = "2021"
 authors = ["Joakim Ohlrogge"]
 license = "MIT OR Apache-2.0"
-description = "A simple, immutable fact stream library inspired by Datomic"
-repository = "https://github.com/johlrogge/stainless-facts"  
+description = "A simple, immutable fact stream library inspired by Datomic with support for I/O and aggregation"
+repository = "https://github.com/johlrogge/stainless-facts"
+documentation = "https://docs.rs/stainless-facts"
 readme = "README.md"
 keywords = ["facts", "event-sourcing", "datomic", "immutable", "schema-evolution"]
 categories = ["data-structures", "database"]
+rust-version = "1.70"
 
 [features]
 default = []
+# Enable async I/O with tokio (sync I/O always available)
 tokio = ["dep:tokio"]
-io = []  # Enable IO functionality (both sync and async)
 
 [dependencies]
+# Core dependencies (always included)
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 thiserror = "1.0"
-parking_lot = "0.12" 
-# IO dependencies (only when io feature enabled)
-fs2 = { version = "0.4"}
 
-# Async dependencies (only when tokio feature enabled)
-tokio = { version = "1", features = ["fs", "io-util", "time"], optional = true }
+# Sync I/O dependencies (always included)
+fs2 = "0.4"
+parking_lot = "0.12"
+
+# Async I/O dependencies (only with tokio feature)
+tokio = { version = "1", features = ["fs", "io-util", "time", "rt-multi-thread", "macros"], optional = true }
 
 [dev-dependencies]
 rstest = "0.26"
@@ -35,3 +39,13 @@ tokio = { version = "1", features = ["macros", "rt"] }
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "basic_usage"
+
+[[example]]
+name = "incremental_sync"
+
+[[example]]
+name = "async_basic_usage"
+required-features = ["tokio"]

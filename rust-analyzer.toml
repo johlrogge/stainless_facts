@@ -1,5 +1,5 @@
 [cargo]
-features = ["tokio"]
+features = ["tokio", "io"]
 
 [check]
 allTargets = true
