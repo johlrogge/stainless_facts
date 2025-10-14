@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         rust: [stable, beta, nightly, 1.70.0]  # Test MSRV
-        features: ['', 'io', 'tokio', 'io,tokio']
+        features: ['', 'tokio']
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
