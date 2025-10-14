@@ -2,9 +2,9 @@
 //!
 //! Run with: cargo run --example async_basic_usage --features tokio
 
-use stainless_facts::{Fact, AsyncFactStore, Operation};
-use serde::{Deserialize, Serialize};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use stainless_facts::{AsyncFactStore, Fact, Operation};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
@@ -16,11 +16,11 @@ enum MyValue {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== AsyncFactStore Example ===\n");
-    
+
     // Create a store
-    let store: AsyncFactStore<String, MyValue, String> = 
+    let store: AsyncFactStore<String, MyValue, String> =
         AsyncFactStore::open_or_create("example_async.facts").await?;
-    
+
     // Add some facts
     let facts = vec![
         Fact::new(
@@ -45,11 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Operation::Assert,
         ),
     ];
-    
+
     println!("Writing {} facts...", facts.len());
     store.append_batch(&facts).await?;
     println!("✓ Facts written\n");
-    
+
     // Read them back
     println!("Reading all facts:");
     let mut iter = store.iter().await;
@@ -59,6 +59,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         count += 1;
     }
     println!("\n✓ Read {} facts", count);
-    
+
     Ok(())
 }

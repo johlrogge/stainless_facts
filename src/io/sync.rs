@@ -1,9 +1,9 @@
 // stainless_facts/src/io/sync.rs
 
-use super::{ReadError, WriteError, common};
+use super::{common, ReadError, WriteError};
 use crate::Fact;
 use fs2::FileExt;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;

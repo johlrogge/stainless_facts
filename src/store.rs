@@ -4,12 +4,12 @@
 // Add to: src/store.rs (new file)
 
 use crate::{
-    Fact,
     io::{FactStreamWriter, ReadError, WriteError},
+    Fact,
 };
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use std::{
     io::BufRead,
     path::{Path, PathBuf},
@@ -275,7 +275,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Fact, Operation, assert_fact_value_format};
+    use crate::{assert_fact_value_format, Fact, Operation};
     use serde::{Deserialize, Serialize};
     use tempfile::NamedTempFile;
 
