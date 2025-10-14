@@ -249,6 +249,11 @@
 //! - **Type Safe**: Leverages Rust's type system
 
 pub mod io;
+pub mod store;
+pub use store::{FactStore, StoreError};
+
+// Also re-export IO types for convenience
+pub use io::{FactStreamReader, FactStreamWriter, ReadError, WriteError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
