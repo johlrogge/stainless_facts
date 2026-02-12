@@ -12,37 +12,45 @@ use std::time::{Duration, Instant};
 pub struct FactStreamWriter {
     file: File,
     writer: BufWriter<File>,
+    lock_timeout: Duration,
 }
 
 impl FactStreamWriter {
     /// Open a fact stream file for writing.
     ///
-    /// Acquires an exclusive lock immediately or fails.
+    /// The lock is acquired only during write operations, not continuously.
+    /// This allows readers to access the file between writes.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, WriteError> {
         Self::open_with_timeout(path, Duration::from_secs(0))
     }
 
-    /// Open with a timeout for acquiring the lock.
+    /// Open with a timeout for acquiring the lock during writes.
     pub fn open_with_timeout(
         path: impl AsRef<Path>,
         timeout: Duration,
     ) -> Result<Self, WriteError> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let writer = BufWriter::new(file.try_clone()?);
+        Ok(Self {
+            file,
+            writer,
+            lock_timeout: timeout,
+        })
+    }
 
+    /// Acquire exclusive lock with configured timeout
+    fn acquire_lock(&self) -> Result<(), WriteError> {
         let start = Instant::now();
         let retry_interval = Duration::from_millis(100);
 
         loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    let writer = BufWriter::new(file.try_clone()?);
-                    return Ok(Self { file, writer });
-                }
-                Err(_) if timeout.is_zero() => {
+            match self.file.try_lock_exclusive() {
+                Ok(()) => return Ok(()),
+                Err(_) if self.lock_timeout.is_zero() => {
                     return Err(WriteError::AlreadyLocked);
                 }
-                Err(_) if start.elapsed() >= timeout => {
-                    return Err(WriteError::LockTimeout(timeout));
+                Err(_) if start.elapsed() >= self.lock_timeout => {
+                    return Err(WriteError::LockTimeout(self.lock_timeout));
                 }
                 Err(_) => {
                     std::thread::sleep(retry_interval);
@@ -53,6 +61,7 @@ impl FactStreamWriter {
 
     /// Write a batch of facts atomically.
     ///
+    /// Acquires exclusive lock, writes all facts, then releases lock.
     /// All facts are serialized to memory first. If serialization fails,
     /// no facts are written. After successful write, fsync ensures durability.
     pub fn write_batch<E, V, S>(&mut self, facts: &[Fact<E, V, S>]) -> Result<(), WriteError>
@@ -62,16 +71,21 @@ impl FactStreamWriter {
         S: Serialize,
     {
         let buffer = common::serialize_batch(facts)?;
-        self.writer.write_all(&buffer)?;
-        self.writer.flush()?;
-        self.file.sync_all()?;
-        Ok(())
-    }
-}
 
-impl Drop for FactStreamWriter {
-    fn drop(&mut self) {
+        // Acquire lock only for the duration of the write
+        self.acquire_lock()?;
+
+        let result = (|| {
+            self.writer.write_all(&buffer)?;
+            self.writer.flush()?;
+            self.file.sync_all()?;
+            Ok(())
+        })();
+
+        // Always release lock, even on error
         let _ = FileExt::unlock(&self.file);
+
+        result
     }
 }
 

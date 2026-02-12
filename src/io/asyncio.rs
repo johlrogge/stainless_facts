@@ -10,13 +10,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 pub struct AsyncFactStreamWriter {
     sync_file: std::fs::File, // For locking
     writer: BufWriter<File>,
+    lock_timeout: Duration,
 }
 
 impl AsyncFactStreamWriter {
+    /// Open a fact stream file for writing.
+    ///
+    /// The lock is acquired only during write operations, not continuously.
+    /// This allows readers to access the file between writes.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, WriteError> {
         Self::open_with_timeout(path, Duration::from_secs(0)).await
     }
 
+    /// Open with a timeout for acquiring the lock during writes.
     pub async fn open_with_timeout(
         path: impl AsRef<Path>,
         timeout: Duration,
@@ -29,24 +35,31 @@ impl AsyncFactStreamWriter {
             .append(true)
             .open(path)?;
 
+        // Convert to async file
+        let std_file = sync_file.try_clone()?;
+        let async_file = File::from_std(std_file);
+        let writer = BufWriter::new(async_file);
+
+        Ok(Self {
+            sync_file,
+            writer,
+            lock_timeout: timeout,
+        })
+    }
+
+    /// Acquire exclusive lock with configured timeout
+    async fn acquire_lock(&self) -> Result<(), WriteError> {
         let start = Instant::now();
         let retry_interval = Duration::from_millis(100);
 
         loop {
-            match sync_file.try_lock_exclusive() {
-                Ok(()) => {
-                    // Convert to async file
-                    let std_file = sync_file.try_clone()?;
-                    let async_file = File::from_std(std_file);
-                    let writer = BufWriter::new(async_file);
-
-                    return Ok(Self { sync_file, writer });
-                }
-                Err(_) if timeout.is_zero() => {
+            match self.sync_file.try_lock_exclusive() {
+                Ok(()) => return Ok(()),
+                Err(_) if self.lock_timeout.is_zero() => {
                     return Err(WriteError::AlreadyLocked);
                 }
-                Err(_) if start.elapsed() >= timeout => {
-                    return Err(WriteError::LockTimeout(timeout));
+                Err(_) if start.elapsed() >= self.lock_timeout => {
+                    return Err(WriteError::LockTimeout(self.lock_timeout));
                 }
                 Err(_) => {
                     tokio::time::sleep(retry_interval).await;
@@ -55,6 +68,9 @@ impl AsyncFactStreamWriter {
         }
     }
 
+    /// Write a batch of facts atomically.
+    ///
+    /// Acquires exclusive lock, writes all facts, then releases lock.
     pub async fn write_batch<E, V, S>(&mut self, facts: &[Fact<E, V, S>]) -> Result<(), WriteError>
     where
         E: Serialize,
@@ -62,16 +78,22 @@ impl AsyncFactStreamWriter {
         S: Serialize,
     {
         let buffer = common::serialize_batch(facts)?;
-        self.writer.write_all(&buffer).await?;
-        self.writer.flush().await?;
-        self.writer.get_ref().sync_all().await?;
-        Ok(())
-    }
-}
 
-impl Drop for AsyncFactStreamWriter {
-    fn drop(&mut self) {
+        // Acquire lock only for the duration of the write
+        self.acquire_lock().await?;
+
+        let result = async {
+            self.writer.write_all(&buffer).await?;
+            self.writer.flush().await?;
+            self.writer.get_ref().sync_all().await?;
+            Ok(())
+        }
+        .await;
+
+        // Always release lock, even on error
         let _ = FileExt::unlock(&self.sync_file);
+
+        result
     }
 }
 
