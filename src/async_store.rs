@@ -3,33 +3,14 @@
 //
 // Add to: src/async_store.rs (new file)
 
-use crate::io::{AsyncFactStreamReader, AsyncFactStreamWriter, ReadError, WriteError};
-use crate::store::DEFAULT_LOCK_TIMEOUT;
+use crate::io::{AsyncFactStreamReader, AsyncFactStreamWriter, ReadError};
+use crate::store::{SinceFilter, StoreError, DEFAULT_LOCK_TIMEOUT};
 use crate::{Fact, StreamPosition};
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
-
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Write error: {0}")]
-    Write(#[from] WriteError),
-
-    #[error("Read error: {0}")]
-    Read(#[from] ReadError),
-
-    #[error("Timestamp ordering violation: new fact at {new} is before latest {latest}")]
-    TimestampOrdering {
-        new: DateTime<Utc>,
-        latest: DateTime<Utc>,
-    },
-}
 
 /// An async, thread-safe fact store that maintains timestamp ordering.
 ///
@@ -82,6 +63,7 @@ pub enum StoreError {
 /// let since = "2024-01-15T00:00:00Z".parse()?;
 /// let mut iter = store.iter_from(since).await;
 /// while let Some(fact) = iter.next().await {
+///     let fact = fact?;
 ///     println!("{:?}", fact);
 /// }
 /// # Ok(())
@@ -103,6 +85,10 @@ where
     S: Serialize + DeserializeOwned + Clone,
 {
     /// Open an existing fact store or create a new one.
+    ///
+    /// An existing file is scanned once for its latest timestamp. Lines
+    /// that fail to decode are skipped by that scan, so they do not prevent
+    /// opening the store; [`iter`](Self::iter) reports them as errors.
     pub async fn open_or_create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
 
@@ -127,11 +113,12 @@ where
     }
 
     /// Set how long an append waits for another writer's file lock before
-    /// failing with [`WriteError::LockTimeout`].
+    /// failing with [`WriteError::LockTimeout`](crate::WriteError::LockTimeout).
     ///
     /// The default is [`DEFAULT_LOCK_TIMEOUT`](crate::store::DEFAULT_LOCK_TIMEOUT).
     /// With [`Duration::ZERO`], an append fails at once with
-    /// [`WriteError::AlreadyLocked`] if the lock is held.
+    /// [`WriteError::AlreadyLocked`](crate::WriteError::AlreadyLocked) if the
+    /// lock is held.
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
         self
@@ -211,7 +198,7 @@ where
     ///
     /// # Errors
     ///
-    /// `StoreError::Read` with [`ReadError::InvalidPosition`] if `at` is
+    /// [`StoreError::Read`] with [`ReadError::InvalidPosition`] if `at` is
     /// past the end of the stream or not at the start of a line.
     pub async fn read_at(
         &self,
@@ -234,6 +221,10 @@ where
     }
 
     /// Iterate over all facts in the store.
+    ///
+    /// Each item is a `Result`: a line that fails to decode is yielded as
+    /// an `Err` and iteration continues past it. See [`AsyncFactIterator`]
+    /// for the error and end-of-stream behaviour.
     pub async fn iter(&self) -> AsyncFactIterator<E, V, S> {
         self.iter_from(DateTime::<Utc>::MIN_UTC).await
     }
@@ -246,14 +237,22 @@ where
     /// To sync incrementally, keep a [`StreamPosition`] and use
     /// [`read_at`](Self::read_at) instead.
     ///
+    /// Items are `Result`s, as for [`iter`](Self::iter). A line that fails
+    /// to decode is yielded as an `Err` even before the start point, since
+    /// its timestamp is unknown.
+    ///
     /// # Performance
     ///
     /// Performs a linear scan from the start of the stream.
     pub async fn iter_from(&self, since: DateTime<Utc>) -> AsyncFactIterator<E, V, S> {
-        AsyncFactIterator::new(self.path.clone(), since).await
+        AsyncFactIterator::new(&self.path, since).await
     }
 
     /// Read the latest timestamp from the file without caching.
+    ///
+    /// Unlike [`iter`](Self::iter), this skips lines that fail to decode
+    /// rather than reporting them, so a malformed line does not prevent
+    /// opening the store. I/O errors still fail.
     async fn read_latest_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>, StoreError> {
         let file = tokio::fs::File::open(path).await?;
         let mut reader = BufReader::new(file);
@@ -274,68 +273,68 @@ where
     }
 }
 
-/// Async iterator over facts in a fact store.
+/// Async iterator over the facts in an [`AsyncFactStore`], returned by
+/// [`AsyncFactStore::iter`] and [`AsyncFactStore::iter_from`].
 ///
-/// Lazily reads facts from disk, yielding only those at or after the starting timestamp.
+/// The async twin of [`FactIterator`](crate::FactIterator), built on an
+/// [`AsyncFactStreamReader`], with the same behaviour:
+///
+/// - A line that fails to decode is yielded as
+///   `Err(`[`ReadError::Deserialization`]`)` and skipped, even before the
+///   starting timestamp is reached.
+/// - After an I/O error (`Err(`[`ReadError::Io`]`)`), [`next`](Self::next)
+///   returns `None` from then on.
+/// - If the store's file does not exist, the iterator is empty.
+/// - Any other error opening the file is yielded as the first item.
+///
+/// Like the reader, it is **not fused**: after `next` returns `None` at the
+/// end of the stream, it returns `Some` again once more facts are appended.
+/// To read a snapshot, stop at the first `None`. This does not apply after
+/// an I/O error or when the file was missing: then it stays empty.
 pub struct AsyncFactIterator<E, V, S> {
-    reader: BufReader<tokio::fs::File>,
-    since: DateTime<Utc>,
-    line_buffer: String,
-    found_starting_point: bool,
-    _phantom: std::marker::PhantomData<(E, V, S)>,
+    /// `None` once iteration has ended for good (missing file, or after an
+    /// I/O error).
+    reader: Option<AsyncFactStreamReader<E, V, S>>,
+    /// An error opening the file, yielded as the first item.
+    open_error: Option<ReadError>,
+    filter: SinceFilter,
 }
 
-impl<E, V, S> AsyncFactIterator<E, V, S>
-where
-    E: DeserializeOwned + Clone,
-    V: DeserializeOwned + Clone,
-    S: DeserializeOwned + Clone,
-{
-    async fn new(path: PathBuf, since: DateTime<Utc>) -> Self {
-        let file = tokio::fs::File::open(&path).await.ok();
-        let reader = file.map(BufReader::new).unwrap_or_else(|| {
-            // Return empty reader if file doesn't exist
-            // Use a never-ready file
-            BufReader::new(tokio::fs::File::from_std(
-                std::fs::File::open("/dev/null").unwrap(),
-            ))
-        });
-
+impl<E, V, S> AsyncFactIterator<E, V, S> {
+    async fn new(path: &Path, since: DateTime<Utc>) -> Self {
+        let (reader, open_error) = match AsyncFactStreamReader::open(path).await {
+            Ok(reader) => (Some(reader), None),
+            Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(e) => (None, Some(e)),
+        };
         Self {
             reader,
-            since,
-            line_buffer: String::with_capacity(1024),
-            found_starting_point: false,
-            _phantom: std::marker::PhantomData,
+            open_error,
+            filter: SinceFilter::new(since),
         }
     }
 
-    /// Read the next fact from the iterator.
-    pub async fn next(&mut self) -> Option<Fact<E, V, S>> {
+    /// Read the next fact, or `None` if no complete line is available yet
+    /// (or iteration has ended after an I/O error).
+    pub async fn next(&mut self) -> Option<Result<Fact<E, V, S>, ReadError>>
+    where
+        E: DeserializeOwned,
+        V: DeserializeOwned,
+        S: DeserializeOwned,
+    {
+        if let Some(e) = self.open_error.take() {
+            return Some(Err(e));
+        }
         loop {
-            self.line_buffer.clear();
-
-            // Read next line
-            let bytes_read = self.reader.read_line(&mut self.line_buffer).await.ok()?;
-            if bytes_read == 0 {
-                return None; // EOF
-            }
-
-            // Parse fact
-            let fact: Fact<E, V, S> = Fact::from_line(&self.line_buffer).ok()?;
-
-            // If we haven't found starting point yet, check timestamp
-            if !self.found_starting_point {
-                if fact.timestamp() >= &self.since {
-                    self.found_starting_point = true;
-                    return Some(fact);
+            match self.reader.as_mut()?.next().await? {
+                Ok(fact) if self.filter.admits(&fact) => return Some(Ok(fact)),
+                Ok(_) => continue,
+                Err(e @ ReadError::Io(_)) => {
+                    self.reader = None;
+                    return Some(Err(e));
                 }
-                // Skip this fact, continue searching
-                continue;
+                Err(e) => return Some(Err(e)),
             }
-
-            // We're past starting point, return all facts
-            return Some(fact);
         }
     }
 }
@@ -347,7 +346,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{assert_fact_value_format, Fact, Operation};
+    use crate::{assert_fact_value_format, Fact, Operation, WriteError};
     use serde::{Deserialize, Serialize};
     use tempfile::NamedTempFile;
 
@@ -438,11 +437,7 @@ mod tests {
         let facts = create_test_facts();
         store.append_batch(&facts).await.unwrap();
 
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter().await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter().await).await;
 
         assert_eq!(read_facts.len(), 3);
         assert_eq!(read_facts, facts);
@@ -459,11 +454,7 @@ mod tests {
 
         // Start from second fact's timestamp
         let since = *facts[1].timestamp();
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter_from(since).await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter_from(since).await).await;
 
         assert_eq!(read_facts.len(), 2);
         assert_eq!(read_facts[0], facts[1]);
@@ -481,11 +472,7 @@ mod tests {
 
         // Start from timestamp after all facts
         let since = "2024-01-15T11:00:00Z".parse().unwrap();
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter_from(since).await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter_from(since).await).await;
 
         assert_eq!(read_facts.len(), 0);
     }
@@ -501,11 +488,7 @@ mod tests {
 
         // Start from timestamp before all facts
         let since = "2024-01-15T09:00:00Z".parse().unwrap();
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter_from(since).await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter_from(since).await).await;
 
         assert_eq!(read_facts.len(), 3);
         assert_eq!(read_facts, facts);
@@ -539,11 +522,7 @@ mod tests {
         {
             let store: AsyncFactStore<String, TestValue, String> =
                 AsyncFactStore::open_or_create(temp.path()).await.unwrap();
-            let mut read_facts = Vec::new();
-            let mut iter = store.iter().await;
-            while let Some(fact) = iter.next().await {
-                read_facts.push(fact);
-            }
+            let read_facts = collect_ok(store.iter().await).await;
             assert_eq!(read_facts.len(), 2);
         }
     }
@@ -632,11 +611,7 @@ mod tests {
         let store: AsyncFactStore<String, TestValue, String> =
             AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
-        let mut facts = Vec::new();
-        let mut iter = store.iter().await;
-        while let Some(fact) = iter.next().await {
-            facts.push(fact);
-        }
+        let facts = collect_ok(store.iter().await).await;
         assert_eq!(facts.len(), 0);
     }
 
@@ -648,6 +623,182 @@ mod tests {
             "source1".to_string(),
             Operation::Assert,
         )
+    }
+
+    type TestFact = Fact<String, TestValue, String>;
+
+    async fn collect_ok(mut iter: AsyncFactIterator<String, TestValue, String>) -> Vec<TestFact> {
+        let mut facts = Vec::new();
+        while let Some(item) = iter.next().await {
+            facts.push(item.unwrap());
+        }
+        facts
+    }
+
+    /// Each item as `Some(fact)`, or `None` for a line that failed to
+    /// decode. Any other error fails the test.
+    async fn outcomes(
+        mut iter: AsyncFactIterator<String, TestValue, String>,
+    ) -> Vec<Option<TestFact>> {
+        let mut items = Vec::new();
+        while let Some(item) = iter.next().await {
+            items.push(match item {
+                Ok(fact) => Some(fact),
+                Err(ReadError::Deserialization(_)) => None,
+                Err(e) => panic!("expected a decode error, got {e:?}"),
+            });
+        }
+        items
+    }
+
+    fn append_garbage_line(path: &Path) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"this is not a fact\n").unwrap();
+    }
+
+    fn at(time: &str) -> DateTime<Utc> {
+        format!("2024-01-15T{time}Z").parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_iter_yields_err_for_malformed_line_and_continues() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let c = count_fact(3, at("10:02:00"));
+
+        store.append(a.clone()).await.unwrap();
+        append_garbage_line(temp.path());
+        store.append_batch(&[b.clone(), c.clone()]).await.unwrap();
+
+        assert_eq!(
+            outcomes(store.iter().await).await,
+            vec![Some(a), None, Some(b), Some(c)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iter_from_yields_err_for_malformed_line_and_continues() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let early = count_fact(0, at("09:00:00"));
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let c = count_fact(3, at("10:02:00"));
+
+        store.append_batch(&[early, a.clone()]).await.unwrap();
+        append_garbage_line(temp.path());
+        store.append_batch(&[b.clone(), c.clone()]).await.unwrap();
+
+        assert_eq!(
+            outcomes(store.iter_from(*a.timestamp()).await).await,
+            vec![Some(a), None, Some(b.clone()), Some(c.clone())]
+        );
+        assert_eq!(
+            outcomes(store.iter_from(*b.timestamp()).await).await,
+            vec![None, Some(b), Some(c)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iter_on_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(dir.path().join("facts.stream"))
+                .await
+                .unwrap();
+
+        let mut iter = store.iter().await;
+        assert!(iter.next().await.is_none());
+        assert!(iter.next().await.is_none());
+        assert!(store.iter_from(at("10:00:00")).await.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_iter_is_not_fused_at_end_of_stream() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        store.append(a.clone()).await.unwrap();
+
+        let mut iter = store.iter().await;
+        assert_eq!(iter.next().await.unwrap().unwrap(), a);
+        assert!(iter.next().await.is_none());
+
+        store.append(b.clone()).await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap(), b);
+        assert!(iter.next().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_iter_stops_after_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.stream");
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(&path).await.unwrap();
+        // A directory opens fine on Unix, but reading it fails.
+        std::fs::create_dir(&path).unwrap();
+
+        let mut iter = store.iter().await;
+        assert!(matches!(iter.next().await, Some(Err(ReadError::Io(_)))));
+        assert!(iter.next().await.is_none());
+        assert!(iter.next().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_iter_yields_open_error_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("sub");
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(parent.join("facts.stream"))
+                .await
+                .unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        std::fs::write(&parent, b"").unwrap();
+
+        let mut iter = store.iter_from(at("10:00:00")).await;
+        assert!(matches!(iter.next().await, Some(Err(ReadError::Io(_)))));
+        assert!(iter.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_timestamp_skips_malformed_lines() {
+        let temp = NamedTempFile::new().unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        {
+            let store: AsyncFactStore<String, TestValue, String> =
+                AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+            store.append(a.clone()).await.unwrap();
+        }
+        append_garbage_line(temp.path());
+
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        assert_eq!(store.latest_timestamp().await, Some(*a.timestamp()));
+    }
+
+    #[tokio::test]
+    async fn test_store_error_is_the_crate_root_store_error() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        store.append(count_fact(2, at("10:01:00"))).await.unwrap();
+
+        // Compiles only if the async store's error is `crate::StoreError`.
+        let result: Result<StreamPosition, crate::StoreError> =
+            store.append(count_fact(1, at("10:00:00"))).await;
+        assert!(matches!(
+            result,
+            Err(crate::StoreError::TimestampOrdering { .. })
+        ));
     }
 
     #[tokio::test]

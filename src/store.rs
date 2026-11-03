@@ -100,6 +100,7 @@ pub enum StoreError {
 /// // Iterate from a timestamp
 /// let since = "2024-01-15T00:00:00Z".parse()?;
 /// for fact in store.iter_from(since) {
+///     let fact = fact?;
 ///     println!("{:?}", fact);
 /// }
 /// # Ok(())
@@ -121,6 +122,10 @@ where
     S: Serialize + DeserializeOwned + Clone,
 {
     /// Open an existing fact store or create a new one.
+    ///
+    /// An existing file is scanned once for its latest timestamp. Lines
+    /// that fail to decode are skipped by that scan, so they do not prevent
+    /// opening the store; [`iter`](Self::iter) reports them as errors.
     pub fn open_or_create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
 
@@ -248,6 +253,10 @@ where
     }
 
     /// Iterate over all facts in the store.
+    ///
+    /// Each item is a `Result`: a line that fails to decode is yielded as
+    /// an `Err` and iteration continues past it. See [`FactIterator`] for
+    /// the error and end-of-stream behaviour.
     pub fn iter(&self) -> FactIterator<E, V, S> {
         self.iter_from(DateTime::<Utc>::MIN_UTC)
     }
@@ -260,14 +269,22 @@ where
     /// To sync incrementally, keep a [`StreamPosition`] and use
     /// [`read_at`](Self::read_at) instead.
     ///
+    /// Items are `Result`s, as for [`iter`](Self::iter). A line that fails
+    /// to decode is yielded as an `Err` even before the start point, since
+    /// its timestamp is unknown.
+    ///
     /// # Performance
     ///
     /// Performs a linear scan from the start of the stream.
     pub fn iter_from(&self, since: DateTime<Utc>) -> FactIterator<E, V, S> {
-        FactIterator::new(self.path.clone(), since)
+        FactIterator::new(&self.path, since)
     }
 
     /// Read the latest timestamp from the file without caching.
+    ///
+    /// Unlike [`iter`](Self::iter), this skips lines that fail to decode
+    /// rather than reporting them, so a malformed line does not prevent
+    /// opening the store. I/O errors still fail.
     fn read_latest_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>, StoreError> {
         let file = std::fs::File::open(path)?;
         let mut reader = std::io::BufReader::new(file);
@@ -288,73 +305,102 @@ where
     }
 }
 
-/// Iterator over facts in a fact store.
-///
-/// Lazily reads facts from disk, yielding only those at or after the starting timestamp.
-pub struct FactIterator<E, V, S> {
-    reader: std::io::BufReader<std::fs::File>,
+/// Tracks the start point of [`FactStore::iter_from`] (and its async twin):
+/// facts are skipped until the first one at or after `since`, and passed
+/// through from then on. Errors always pass through.
+pub(crate) struct SinceFilter {
     since: DateTime<Utc>,
-    line_buffer: String,
     found_starting_point: bool,
-    _phantom: std::marker::PhantomData<(E, V, S)>,
 }
 
-impl<E, V, S> FactIterator<E, V, S>
-where
-    E: DeserializeOwned + Clone,
-    V: DeserializeOwned + Clone,
-    S: DeserializeOwned + Clone,
-{
-    fn new(path: PathBuf, since: DateTime<Utc>) -> Self {
-        let file = std::fs::File::open(&path).ok();
-        let reader = file.map(std::io::BufReader::new).unwrap_or_else(|| {
-            // Return empty reader if file doesn't exist
-            std::io::BufReader::new(std::fs::File::open("/dev/null").unwrap())
-        });
+impl SinceFilter {
+    pub(crate) fn new(since: DateTime<Utc>) -> Self {
+        Self {
+            since,
+            found_starting_point: false,
+        }
+    }
 
+    /// Whether `fact` should be yielded.
+    pub(crate) fn admits<E, V, S>(&mut self, fact: &Fact<E, V, S>) -> bool {
+        if !self.found_starting_point && fact.timestamp() >= &self.since {
+            self.found_starting_point = true;
+        }
+        self.found_starting_point
+    }
+}
+
+/// Iterator over the facts in a [`FactStore`], returned by
+/// [`FactStore::iter`] and [`FactStore::iter_from`].
+///
+/// Lazily reads facts from disk with a [`FactStreamReader`], yielding the
+/// facts from the first one at or after the starting timestamp.
+///
+/// # Errors
+///
+/// - A line that fails to decode is yielded as
+///   `Err(`[`ReadError::Deserialization`]`)` and skipped, so iteration can
+///   continue past it. Such a line is reported even before the starting
+///   timestamp is reached, since its timestamp is unknown.
+/// - After an I/O error (`Err(`[`ReadError::Io`]`)`), the iterator returns
+///   `None` from then on, so a persistent error cannot loop forever.
+/// - If the store's file does not exist, the iterator is empty.
+/// - Any other error opening the file is yielded as the first item, and the
+///   iterator then returns `None`.
+///
+/// # Tailing
+///
+/// Like [`FactStreamReader`], the iterator is **not fused**: after it
+/// returns `None` at the end of the stream, it returns `Some` again once
+/// more facts are appended. To read a snapshot, stop at the first `None`
+/// (as a `for` loop does). This does not apply after an I/O error or when
+/// the file was missing when the iterator was created: then it stays empty.
+pub struct FactIterator<E, V, S> {
+    /// `None` once iteration has ended for good (missing file, or after an
+    /// I/O error).
+    reader: Option<FactStreamReader<E, V, S>>,
+    /// An error opening the file, yielded as the first item.
+    open_error: Option<ReadError>,
+    filter: SinceFilter,
+}
+
+impl<E, V, S> FactIterator<E, V, S> {
+    fn new(path: &Path, since: DateTime<Utc>) -> Self {
+        let (reader, open_error) = match FactStreamReader::open(path) {
+            Ok(reader) => (Some(reader), None),
+            Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(e) => (None, Some(e)),
+        };
         Self {
             reader,
-            since,
-            line_buffer: String::with_capacity(1024),
-            found_starting_point: false,
-            _phantom: std::marker::PhantomData,
+            open_error,
+            filter: SinceFilter::new(since),
         }
     }
 }
 
 impl<E, V, S> Iterator for FactIterator<E, V, S>
 where
-    E: DeserializeOwned + Clone,
-    V: DeserializeOwned + Clone,
-    S: DeserializeOwned + Clone,
+    E: DeserializeOwned,
+    V: DeserializeOwned,
+    S: DeserializeOwned,
 {
-    type Item = Fact<E, V, S>;
+    type Item = Result<Fact<E, V, S>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(e) = self.open_error.take() {
+            return Some(Err(e));
+        }
         loop {
-            self.line_buffer.clear();
-
-            // Read next line
-            let bytes_read = self.reader.read_line(&mut self.line_buffer).ok()?;
-            if bytes_read == 0 {
-                return None; // EOF
-            }
-
-            // Parse fact
-            let fact: Fact<E, V, S> = Fact::from_line(&self.line_buffer).ok()?;
-
-            // If we haven't found starting point yet, check timestamp
-            if !self.found_starting_point {
-                if fact.timestamp() >= &self.since {
-                    self.found_starting_point = true;
-                    return Some(fact);
+            match self.reader.as_mut()?.next()? {
+                Ok(fact) if self.filter.admits(&fact) => return Some(Ok(fact)),
+                Ok(_) => continue,
+                Err(e @ ReadError::Io(_)) => {
+                    self.reader = None;
+                    return Some(Err(e));
                 }
-                // Skip this fact, continue searching
-                continue;
+                Err(e) => return Some(Err(e)),
             }
-
-            // We're past starting point, return all facts
-            return Some(fact);
         }
     }
 }
@@ -453,7 +499,7 @@ mod tests {
         let facts = create_test_facts();
         store.append_batch(&facts).unwrap();
 
-        let read_facts: Vec<_> = store.iter().collect();
+        let read_facts = collect_ok(store.iter());
         assert_eq!(read_facts.len(), 3);
         assert_eq!(read_facts, facts);
     }
@@ -468,7 +514,7 @@ mod tests {
 
         // Start from second fact's timestamp
         let since = *facts[1].timestamp();
-        let read_facts: Vec<_> = store.iter_from(since).collect();
+        let read_facts = collect_ok(store.iter_from(since));
 
         assert_eq!(read_facts.len(), 2);
         assert_eq!(read_facts[0], facts[1]);
@@ -485,7 +531,7 @@ mod tests {
 
         // Start from timestamp after all facts
         let since = "2024-01-15T11:00:00Z".parse().unwrap();
-        let read_facts: Vec<_> = store.iter_from(since).collect();
+        let read_facts = collect_ok(store.iter_from(since));
 
         assert_eq!(read_facts.len(), 0);
     }
@@ -500,7 +546,7 @@ mod tests {
 
         // Start from timestamp before all facts
         let since = "2024-01-15T09:00:00Z".parse().unwrap();
-        let read_facts: Vec<_> = store.iter_from(since).collect();
+        let read_facts = collect_ok(store.iter_from(since));
 
         assert_eq!(read_facts.len(), 3);
         assert_eq!(read_facts, facts);
@@ -534,7 +580,7 @@ mod tests {
         {
             let store: FactStore<String, TestValue, String> =
                 FactStore::open_or_create(temp.path()).unwrap();
-            let read_facts: Vec<_> = store.iter().collect();
+            let read_facts = collect_ok(store.iter());
             assert_eq!(read_facts.len(), 2);
         }
     }
@@ -613,8 +659,161 @@ mod tests {
         let store: FactStore<String, TestValue, String> =
             FactStore::open_or_create(temp.path()).unwrap();
 
-        let facts: Vec<_> = store.iter().collect();
+        let facts = collect_ok(store.iter());
         assert_eq!(facts.len(), 0);
+    }
+
+    type TestFact = Fact<String, TestValue, String>;
+
+    fn collect_ok(iter: FactIterator<String, TestValue, String>) -> Vec<TestFact> {
+        iter.collect::<Result<_, _>>().unwrap()
+    }
+
+    /// Each item as `Some(fact)`, or `None` for a line that failed to
+    /// decode. Any other error fails the test.
+    fn outcomes(iter: FactIterator<String, TestValue, String>) -> Vec<Option<TestFact>> {
+        iter.map(|item| match item {
+            Ok(fact) => Some(fact),
+            Err(ReadError::Deserialization(_)) => None,
+            Err(e) => panic!("expected a decode error, got {e:?}"),
+        })
+        .collect()
+    }
+
+    fn append_garbage_line(path: &Path) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"this is not a fact\n").unwrap();
+    }
+
+    fn at(time: &str) -> DateTime<Utc> {
+        format!("2024-01-15T{time}Z").parse().unwrap()
+    }
+
+    #[test]
+    fn test_iter_yields_err_for_malformed_line_and_continues() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let c = count_fact(3, at("10:02:00"));
+
+        store.append(a.clone()).unwrap();
+        append_garbage_line(temp.path());
+        store.append_batch(&[b.clone(), c.clone()]).unwrap();
+
+        assert_eq!(
+            outcomes(store.iter()),
+            vec![Some(a), None, Some(b), Some(c)]
+        );
+    }
+
+    #[test]
+    fn test_iter_from_yields_err_for_malformed_line_and_continues() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        let early = count_fact(0, at("09:00:00"));
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let c = count_fact(3, at("10:02:00"));
+
+        store.append_batch(&[early, a.clone()]).unwrap();
+        append_garbage_line(temp.path());
+        store.append_batch(&[b.clone(), c.clone()]).unwrap();
+
+        // The fact before `since` is filtered out; the malformed line after
+        // the start point is still reported.
+        assert_eq!(
+            outcomes(store.iter_from(*a.timestamp())),
+            vec![Some(a), None, Some(b.clone()), Some(c.clone())]
+        );
+
+        // A malformed line before the start point is reported too: its
+        // timestamp is unknown, so it cannot be filtered out.
+        assert_eq!(
+            outcomes(store.iter_from(*b.timestamp())),
+            vec![None, Some(b), Some(c)]
+        );
+    }
+
+    #[test]
+    fn test_iter_on_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(dir.path().join("facts.stream")).unwrap();
+
+        let mut iter = store.iter();
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(store.iter_from(at("10:00:00")).next().is_none());
+    }
+
+    #[test]
+    fn test_iter_is_not_fused_at_end_of_stream() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        store.append(a.clone()).unwrap();
+
+        let mut iter = store.iter();
+        assert_eq!(iter.next().unwrap().unwrap(), a);
+        assert!(iter.next().is_none());
+
+        store.append(b.clone()).unwrap();
+        assert_eq!(iter.next().unwrap().unwrap(), b);
+        assert!(iter.next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_iter_stops_after_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.stream");
+        let store: FactStore<String, TestValue, String> = FactStore::open_or_create(&path).unwrap();
+        // A directory opens fine on Unix, but reading it fails.
+        std::fs::create_dir(&path).unwrap();
+
+        let mut iter = store.iter();
+        assert!(matches!(iter.next(), Some(Err(ReadError::Io(_)))));
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_iter_yields_open_error_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("sub");
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(parent.join("facts.stream")).unwrap();
+        // Replace the parent directory with a file: opening the stream now
+        // fails with an error other than "not found".
+        std::fs::remove_dir(&parent).unwrap();
+        std::fs::write(&parent, b"").unwrap();
+
+        let mut iter = store.iter_from(at("10:00:00"));
+        assert!(matches!(iter.next(), Some(Err(ReadError::Io(_)))));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_read_latest_timestamp_skips_malformed_lines() {
+        let temp = NamedTempFile::new().unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        {
+            let store: FactStore<String, TestValue, String> =
+                FactStore::open_or_create(temp.path()).unwrap();
+            store.append(a.clone()).unwrap();
+        }
+        append_garbage_line(temp.path());
+
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        assert_eq!(store.latest_timestamp(), Some(*a.timestamp()));
     }
 
     fn count_fact(n: u32, timestamp: DateTime<Utc>) -> Fact<String, TestValue, String> {
