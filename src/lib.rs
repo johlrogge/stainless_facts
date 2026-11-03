@@ -137,6 +137,22 @@ pub trait FactAggregator<E, V, S> {
 
     /// Handle an unknown retraction.
     fn retract_unknown(&mut self, _attribute: &str, _value: &JsonValue, _source: &S) {}
+
+    /// Whether this aggregate has become empty and should be removed.
+    ///
+    /// The fold functions (such as [`aggregate_facts_into`]) check this after
+    /// every Retract they dispatch to the aggregate, never after an Assert. If
+    /// it returns `true`, the fold removes the entry from the map. The key
+    /// still appears in the returned touched set, so callers see the change.
+    /// A later Assert for the same entity recreates the aggregate from scratch
+    /// (via `A::default()`, or the `init` passed to
+    /// [`aggregate_facts_into_with`]).
+    ///
+    /// Override it to express "reset to empty when the last tracked fact is
+    /// retracted". The default returns `false`, so entries are never removed.
+    fn is_retired(&self) -> bool {
+        false
+    }
 }
 
 /// Aggregate an iterator of facts into a map of aggregated entities.
@@ -164,27 +180,57 @@ where
 /// This resumes a fold: for any split of a fact sequence into a prefix and a
 /// suffix, folding the suffix into `aggregate_facts(prefix)` gives the same
 /// map as `aggregate_facts` over the whole sequence. New entities start from
-/// `A::default()`.
+/// `A::default()`; use [`aggregate_facts_into_with`] to build them from their
+/// key instead.
 ///
 /// A Retract against an entity with no aggregate is a no-op: no entry is
-/// created and the entity is not touched.
+/// created and the entity is not touched. After a Retract is dispatched, an
+/// aggregate whose [`FactAggregator::is_retired`] returns `true` is removed
+/// from the map; a later Assert recreates it from `A::default()`.
 ///
 /// # Touched set
 ///
 /// The returned set contains exactly the keys whose map state this call
 /// changed: inserted, mutated (a fact was dispatched to the aggregate), or
 /// removed. A touched key that is absent from the map afterwards has been
-/// retired. A Retract against an absent key is excluded, because nothing
-/// changed. Keys not in the set were left exactly as they were, so a caller
-/// only needs to revisit (for example with [`retain_touched`]) the touched
-/// keys.
+/// retired: a Retract left it reporting [`FactAggregator::is_retired`], and
+/// no later Assert in `facts` recreated it. A Retract against an absent key
+/// is excluded, because nothing changed. Keys not in the set were left
+/// exactly as they were, so a caller only needs to revisit (for example with
+/// [`retain_touched`]) the touched keys.
 pub fn aggregate_facts_into<E, V, S, A, I>(aggregates: &mut HashMap<E, A>, facts: I) -> HashSet<E>
 where
     E: Eq + Hash + Clone,
     A: FactAggregator<E, V, S> + Default,
     I: IntoIterator<Item = Fact<E, V, S>>,
 {
-    fold_into_with(aggregates, facts, |_| A::default())
+    aggregate_facts_into_with(aggregates, facts, |_| A::default())
+}
+
+/// Like [`aggregate_facts_into`], but new entities are built by `init`, which
+/// receives the entity key.
+///
+/// This works like [`Entry::or_insert_with_key`]: `init(&key)` is called only
+/// when an Assert reaches an entity with no aggregate in the map. That covers
+/// a brand-new entity and one that was retired earlier (see
+/// [`FactAggregator::is_retired`]). It is not called for entities already in
+/// the map, and not for a Retract against an absent entity, which is a no-op.
+/// This lets an aggregate know its own entity without a placeholder
+/// `Default` or a post-pass, and it does not require `A: Default`.
+///
+/// The returned touched set has the same contract as for
+/// [`aggregate_facts_into`].
+pub fn aggregate_facts_into_with<E, V, S, A, I>(
+    aggregates: &mut HashMap<E, A>,
+    facts: I,
+    init: impl FnMut(&E) -> A,
+) -> HashSet<E>
+where
+    E: Eq + Hash + Clone,
+    A: FactAggregator<E, V, S>,
+    I: IntoIterator<Item = Fact<E, V, S>>,
+{
+    fold_into_with(aggregates, facts, init)
 }
 
 /// The single fold behind every public aggregation entry point.
@@ -192,7 +238,9 @@ where
 /// Per fact, in order: dispatch to the existing aggregate if there is one;
 /// otherwise skip a Retract (no insert, no `init`, not touched) or insert
 /// `init(&key)` for an Assert and dispatch to it. Every dispatched key is
-/// recorded in the returned touched set.
+/// recorded in the returned touched set. After a dispatched Retract, an
+/// aggregate reporting [`FactAggregator::is_retired`] is removed; its key
+/// stays touched.
 fn fold_into_with<E, V, S, A, I>(
     aggregates: &mut HashMap<E, A>,
     facts: I,
@@ -215,9 +263,13 @@ where
             }
         };
         aggregate.apply(&fact);
+        let retired = fact.operation() == Operation::Retract && aggregate.is_retired();
 
         if !touched.contains(fact.entity()) {
             touched.insert(fact.entity().clone());
+        }
+        if retired {
+            aggregates.remove(fact.entity());
         }
     }
 
@@ -568,6 +620,216 @@ mod tests {
         assert_eq!(aggregates["c"], titles(&["keep"]));
     }
 
+    /// Knows its own entity (set by `init`) and retires when emptied by a
+    /// retract.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Keyed {
+        key: String,
+        titles: Vec<String>,
+    }
+
+    impl Keyed {
+        fn new(key: &str) -> Self {
+            Keyed {
+                key: key.to_owned(),
+                titles: Vec::new(),
+            }
+        }
+    }
+
+    impl FactAggregator<String, TestValue, String> for Keyed {
+        fn assert(&mut self, value: &TestValue, _source: &String) {
+            let TestValue::Title(title) = value;
+            self.titles.push(title.clone());
+        }
+
+        fn retract(&mut self, value: &TestValue, _source: &String) {
+            let TestValue::Title(title) = value;
+            self.titles.retain(|t| t != title);
+        }
+
+        fn is_retired(&self) -> bool {
+            self.titles.is_empty()
+        }
+    }
+
+    #[test]
+    fn init_is_called_exactly_once_per_new_entity_with_its_key() {
+        let mut aggregates: HashMap<String, Keyed> = HashMap::new();
+        let mut calls = Vec::new();
+
+        let facts = vec![
+            fact("a", "one", Operation::Assert),
+            fact("b", "two", Operation::Assert),
+            fact("a", "three", Operation::Assert),
+            fact("b", "four", Operation::Assert),
+        ];
+        aggregate_facts_into_with(&mut aggregates, facts, |key| {
+            calls.push(key.clone());
+            Keyed::new(key)
+        });
+
+        calls.sort();
+        assert_eq!(calls, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(aggregates["a"].key, "a");
+        assert_eq!(aggregates["b"].key, "b");
+        assert_eq!(aggregates["a"].titles, vec!["one", "three"]);
+    }
+
+    #[test]
+    fn init_is_not_called_for_entities_already_in_the_map() {
+        let mut aggregates: HashMap<String, Keyed> = HashMap::new();
+        aggregates.insert("a".to_string(), Keyed::new("a"));
+        let mut calls = Vec::new();
+
+        aggregate_facts_into_with(
+            &mut aggregates,
+            vec![
+                fact("a", "one", Operation::Assert),
+                fact("a", "two", Operation::Assert),
+            ],
+            |key| {
+                calls.push(key.clone());
+                Keyed::new(key)
+            },
+        );
+
+        assert!(calls.is_empty());
+        assert_eq!(aggregates["a"].titles, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn init_is_not_called_when_a_retract_hits_an_absent_entity() {
+        let mut aggregates: HashMap<String, Keyed> = HashMap::new();
+        let mut calls = Vec::new();
+
+        let touched = aggregate_facts_into_with(
+            &mut aggregates,
+            vec![fact("ghost", "one", Operation::Retract)],
+            |key| {
+                calls.push(key.clone());
+                Keyed::new(key)
+            },
+        );
+
+        assert!(calls.is_empty());
+        assert!(aggregates.is_empty());
+        assert!(touched.is_empty());
+    }
+
+    #[test]
+    fn retired_entity_is_recreated_fresh_by_init_on_next_assert() {
+        let mut aggregates: HashMap<String, Keyed> = HashMap::new();
+        let mut calls = Vec::new();
+
+        aggregate_facts_into_with(
+            &mut aggregates,
+            vec![
+                fact("a", "one", Operation::Assert),
+                fact("a", "one", Operation::Retract),
+                fact("a", "two", Operation::Assert),
+            ],
+            |key| {
+                calls.push(key.clone());
+                Keyed::new(key)
+            },
+        );
+
+        assert_eq!(calls, vec!["a".to_string(), "a".to_string()]);
+        assert_eq!(
+            aggregates["a"],
+            Keyed {
+                key: "a".to_string(),
+                titles: vec!["two".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn retired_entity_is_touched_and_absent_from_the_map() {
+        let mut aggregates: HashMap<String, Keyed> = HashMap::new();
+        aggregates.insert(
+            "a".to_string(),
+            Keyed {
+                key: "a".to_string(),
+                titles: vec!["one".to_string()],
+            },
+        );
+
+        let touched = aggregate_facts_into_with(
+            &mut aggregates,
+            vec![fact("a", "one", Operation::Retract)],
+            |key| Keyed::new(key),
+        );
+
+        assert!(!aggregates.contains_key("a"));
+        assert_eq!(touched, keys(&["a"]));
+    }
+
+    #[test]
+    fn retirement_also_applies_through_aggregate_facts_into() {
+        #[derive(Debug, Default)]
+        struct Counter(u32);
+        impl FactAggregator<String, TestValue, String> for Counter {
+            fn assert(&mut self, _value: &TestValue, _source: &String) {
+                self.0 += 1;
+            }
+            fn retract(&mut self, _value: &TestValue, _source: &String) {
+                self.0 = self.0.saturating_sub(1);
+            }
+            fn is_retired(&self) -> bool {
+                self.0 == 0
+            }
+        }
+
+        let mut aggregates: HashMap<String, Counter> = HashMap::new();
+        let touched = aggregate_facts_into(
+            &mut aggregates,
+            vec![
+                fact("a", "one", Operation::Assert),
+                fact("a", "one", Operation::Retract),
+            ],
+        );
+
+        assert!(aggregates.is_empty());
+        assert_eq!(touched, keys(&["a"]));
+    }
+
+    /// Always reports retired; used to show `is_retired` is not checked after
+    /// an Assert.
+    #[derive(Debug, Default)]
+    struct AlwaysRetired(u32);
+
+    impl FactAggregator<String, TestValue, String> for AlwaysRetired {
+        fn assert(&mut self, _value: &TestValue, _source: &String) {
+            self.0 += 1;
+        }
+        fn retract(&mut self, _value: &TestValue, _source: &String) {}
+        fn is_retired(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn aggregate_reporting_retired_after_an_assert_is_kept() {
+        let mut aggregates: HashMap<String, AlwaysRetired> = HashMap::new();
+
+        let touched = aggregate_facts_into(
+            &mut aggregates,
+            vec![
+                fact("a", "one", Operation::Assert),
+                fact("a", "two", Operation::Assert),
+            ],
+        );
+
+        assert_eq!(aggregates["a"].0, 2);
+        assert_eq!(touched, keys(&["a"]));
+
+        // The same aggregate is removed as soon as a Retract reaches it.
+        aggregate_facts_into(&mut aggregates, vec![fact("a", "one", Operation::Retract)]);
+        assert!(!aggregates.contains_key("a"));
+    }
+
     mod split_fold {
         use super::*;
         use proptest::prelude::*;
@@ -622,6 +884,46 @@ mod tests {
                         if !expected_touched(&before, suffix).contains(key) {
                             prop_assert_eq!(Some(agg), before.get(key));
                         }
+                    }
+                }
+            }
+
+            #[test]
+            fn keyed_init_with_retirement_split_fold_equals_whole_fold(facts in facts_strategy()) {
+                let mut whole: HashMap<String, Keyed> = HashMap::new();
+                aggregate_facts_into_with(&mut whole, facts.clone(), |key| Keyed::new(key));
+                for (key, agg) in &whole {
+                    prop_assert_eq!(&agg.key, key);
+                }
+
+                for k in 0..=facts.len() {
+                    let (prefix, suffix) = facts.split_at(k);
+                    let mut resumed: HashMap<String, Keyed> = HashMap::new();
+                    aggregate_facts_into_with(&mut resumed, prefix.to_vec(), |key| Keyed::new(key));
+                    for (key, agg) in &resumed {
+                        prop_assert_eq!(&agg.key, key, "prefix, split point k = {}", k);
+                    }
+                    let before = resumed.clone();
+
+                    let touched =
+                        aggregate_facts_into_with(&mut resumed, suffix.to_vec(), |key| Keyed::new(key));
+
+                    for (key, agg) in &resumed {
+                        prop_assert_eq!(&agg.key, key, "resumed, split point k = {}", k);
+                    }
+                    prop_assert_eq!(&resumed, &whole, "split point k = {}", k);
+
+                    // Every key whose state changed (inserted, mutated or
+                    // retired) is reported as touched.
+                    let all_keys: HashSet<&String> = before.keys().chain(resumed.keys()).collect();
+                    for key in all_keys {
+                        if before.get(key) != resumed.get(key) {
+                            prop_assert!(touched.contains(key), "key {} changed but not touched, k = {}", key, k);
+                        }
+                    }
+                    // Touched keys all appear in the delta.
+                    for key in &touched {
+                        prop_assert!(suffix.iter().any(|f| f.entity() == key));
                     }
                 }
             }
