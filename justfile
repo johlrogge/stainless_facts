@@ -14,28 +14,44 @@ watch:
 
 # check all feature combinations
 [group('build')]
-check-all: check-default check-tokio
+check-all: check-core check-io check-tokio
 
 [group('build')]
-check-default:
-    @echo "=== Checking: Default (sync I/O) ==="
+check-core:
+    @echo "=== Checking: core (no features) ==="
     cargo check
+
+[group('build')]
+check-io:
+    @echo "=== Checking: io (sync I/O) ==="
+    cargo check --features io
 
 [group('build')]
 check-tokio:
     @echo "=== Checking: tokio (sync + async I/O) ==="
     cargo check --features tokio
 
+# check the core build for wasm32 (requires the wasm32-unknown-unknown target)
+[group('build')]
+check-wasm:
+    @echo "=== Checking: core for wasm32-unknown-unknown ==="
+    cargo check --target wasm32-unknown-unknown
+
 # === Test Commands ===
 
 # test all feature combinations
 [group('build')]
-test-all: test-default test-tokio
+test-all: test-core test-io test-tokio
 
 [group('build')]
-test-default:
-    @echo "=== Testing: Default (sync I/O) ==="
+test-core:
+    @echo "=== Testing: core (no features) ==="
     cargo test
+
+[group('build')]
+test-io:
+    @echo "=== Testing: io (sync I/O) ==="
+    cargo test --features io
 
 [group('build')]
 test-tokio:
@@ -46,37 +62,47 @@ test-tokio:
 
 # clippy all feature combinations
 [group('build')]
-clippy-all: clippy-default clippy-tokio
+clippy-all: clippy-core clippy-io clippy-tokio
 
 [group('build')]
-clippy-default:
-    @echo "=== Clippy: Default (sync I/O) ==="
-    cargo clippy -- -D warnings
+clippy-core:
+    @echo "=== Clippy: core (no features) ==="
+    cargo clippy --all-targets -- -D warnings
+
+[group('build')]
+clippy-io:
+    @echo "=== Clippy: io (sync I/O) ==="
+    cargo clippy --all-targets --features io -- -D warnings
 
 [group('build')]
 clippy-tokio:
     @echo "=== Clippy: tokio (sync + async I/O) ==="
-    cargo clippy --features tokio -- -D warnings
+    cargo clippy --all-targets --features tokio -- -D warnings
 
 # === Build Commands ===
 
 # build all feature combinations
 [group('build')]
-build-all: build-default build-tokio
+build-all: build-core build-io build-tokio
 
 [group('build')]
-build-default:
-    @echo "=== Building: Default (sync I/O) ==="
+build-core:
+    @echo "=== Building: core (no features) ==="
     cargo build
+
+[group('build')]
+build-io:
+    @echo "=== Building: io (sync I/O) ==="
+    cargo build --features io
 
 [group('build')]
 build-tokio:
     @echo "=== Building: tokio (sync + async I/O) ==="
     cargo build --features tokio
 
-# just build default
+# just build core
 [group('build')]
-build: build-default
+build: build-core
 
 # === CI Command ===
 
@@ -86,12 +112,12 @@ ci: check-all test-all clippy-all
 
 # === Quick Commands ===
 
-# quick check default
+# quick check core
 [group('build')]
 quick:
     cargo check
 
-# quick test default
+# quick test core
 [group('build')]
 quick-test:
     cargo test
@@ -114,6 +140,11 @@ fmt-check:
 [group('docs')]
 doc:
     cargo doc --all-features --no-deps --open
+
+# build documentation without opening it
+[group('docs')]
+doc-check:
+    cargo doc --all-features --no-deps
 
 # === Cleanup ===
 

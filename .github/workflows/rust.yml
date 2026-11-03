@@ -10,61 +10,55 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Test default features
-  test-default:
+  # Test each feature set: core only (no features), sync I/O, and async I/O
+  test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, beta, nightly, 1.85.0]
-    name: test-default-${{ matrix.rust }}
+        rust: [stable, beta, nightly, 1.99.0]
+        features:
+          - { name: core, flags: "" }
+          - { name: io, flags: "--features io" }
+          - { name: tokio, flags: "--features tokio" }
+    name: test-${{ matrix.features.name }}-${{ matrix.rust }}
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
     - name: Build
-      run: cargo build --verbose
+      run: cargo build ${{ matrix.features.flags }} --verbose
     - name: Test
-      run: cargo test --verbose
+      run: cargo test ${{ matrix.features.flags }} --verbose
 
-  # Test with tokio feature
-  test-tokio:
+  # Clippy on each feature set, including tests and examples
+  clippy:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, beta, nightly, 1.85.0]
-    name: test-tokio-${{ matrix.rust }}
-    steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ matrix.rust }}
-    - name: Build
-      run: cargo build --features tokio --verbose
-    - name: Test
-      run: cargo test --features tokio --verbose
-
-  # Clippy on default
-  clippy-default:
-    runs-on: ubuntu-latest
+        features:
+          - { name: core, flags: "" }
+          - { name: io, flags: "--features io" }
+          - { name: tokio, flags: "--features tokio" }
+    name: clippy-${{ matrix.features.name }}
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
     - name: Clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --all-targets ${{ matrix.features.flags }} -- -D warnings
 
-  # Clippy with tokio
-  clippy-tokio:
+  # Core (no features) must build for wasm32
+  wasm-core:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
       with:
-        components: clippy
-    - name: Clippy
-      run: cargo clippy --features tokio -- -D warnings
+        targets: wasm32-unknown-unknown
+    - name: Check core for wasm32
+      run: cargo check --target wasm32-unknown-unknown
 
   # Format check
   fmt:

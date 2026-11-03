@@ -22,26 +22,26 @@ Facts are aggregated into useful data structures using the `FactAggregator` trai
 - **Core Fact System**: Immutable, timestamped facts with assert/retract operations
 - **Aggregation**: Build domain models from fact streams using `FactAggregator`
 - **Zero-Copy Capable**: Builder pattern for efficient aggregation with `Buildable` trait
-- **I/O Support** (optional): Thread-safe fact storage with `FactStore`
+- **I/O Support** (optional, `io` feature): Thread-safe fact storage with `FactStore`
 - **Incremental Sync**: Efficiently iterate from any timestamp for distributed systems
-- **Async Support** (optional): Tokio-based async readers/writers
+- **Async Support** (optional, `tokio` feature): Tokio-based async readers/writers
 - **Schema Evolution**: Graceful handling of unknown attributes
 - **Time Travel**: Query historical state by filtering facts
 - **Audit Trail**: Complete history of all changes
 
 ## Optional Features
 
-By default, stainless-facts provides only the core fact types and aggregation logic with no I/O dependencies.
+By default (`default = []`), stainless-facts provides only the core fact types and aggregation logic. The core depends only on `serde`, `serde_json`, `chrono` and `thiserror`, and builds for `wasm32-unknown-unknown`.
 
 Enable additional features as needed:
 
-- **`io`**: Enables `FactStore` and synchronous file I/O (adds `fs2` and `parking_lot` dependencies)
-- **`tokio`**: Enables async I/O with tokio (implies `io` feature)
+- **`io`**: Enables `FactStore`, `FactStreamReader`/`FactStreamWriter` (and their error types) and synchronous file I/O (adds `fs2` and `parking_lot` dependencies)
+- **`tokio`**: Enables async I/O with tokio (implies `io`)
 
 ```toml
 # Cargo.toml
 
-# Core only (no I/O)
+# Core only (no file I/O)
 stainless-facts = "0.2"
 
 # With synchronous I/O
@@ -56,6 +56,9 @@ stainless-facts = { version = "0.2", features = ["tokio"] }
 ```toml
 [dependencies]
 stainless-facts = "0.2"
+
+# To use FactStore or the stream reader/writer:
+# stainless-facts = { version = "0.2", features = ["io"] }
 ```
 
 ## Serialization Contract
@@ -196,7 +199,7 @@ fn main() {
 
 ## Using FactStore
 
-When you enable the `io` feature, you can use `FactStore` for persistent, thread-safe fact storage with incremental synchronization:
+`FactStore` requires the `io` feature (`stainless-facts = { version = "0.2", features = ["io"] }`). It provides persistent, thread-safe fact storage with incremental synchronization:
 
 ```rust
 use stainless_facts::{Fact, FactStore, Operation};

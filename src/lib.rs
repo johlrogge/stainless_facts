@@ -3,14 +3,26 @@
 //! A simple, immutable fact stream library inspired by Datomic, designed for systems
 //! that need schema evolution and time-travel capabilities.
 //!
-//! By default, this library includes synchronous I/O with `FactStore`. Enable the `tokio`
-//! feature for async I/O with `AsyncFactStore`.
+//! By default, this library provides only the core fact types and aggregation logic,
+//! with no I/O dependencies. Enable the `io` feature for synchronous file I/O with
+//! `FactStore`, or the `tokio` feature (which implies `io`) for async I/O with
+//! `AsyncFactStore`.
 
-// Sync I/O - always available
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+// Sync I/O - only with io feature
+#[cfg(feature = "io")]
+#[cfg_attr(docsrs, doc(cfg(feature = "io")))]
 pub mod io;
+#[cfg(feature = "io")]
+#[cfg_attr(docsrs, doc(cfg(feature = "io")))]
 pub mod store;
 
+#[cfg(feature = "io")]
+#[cfg_attr(docsrs, doc(cfg(feature = "io")))]
 pub use io::{FactStreamReader, FactStreamWriter, ReadError, WriteError};
+#[cfg(feature = "io")]
+#[cfg_attr(docsrs, doc(cfg(feature = "io")))]
 pub use store::{FactIterator, FactStore, StoreError};
 
 // Async I/O - only with tokio feature
@@ -18,6 +30,7 @@ pub use store::{FactIterator, FactStore, StoreError};
 mod async_store;
 
 #[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use async_store::{AsyncFactIterator, AsyncFactStore};
 
 // Core types
@@ -165,4 +178,60 @@ macro_rules! assert_fact_value_format {
             "Value must have exactly 2 fields: 't' and 'v'"
         );
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "t", content = "v")]
+    enum TestValue {
+        Title(String),
+    }
+
+    #[derive(Default)]
+    struct Titles(Vec<String>);
+
+    impl FactAggregator<String, TestValue, String> for Titles {
+        fn assert(&mut self, value: &TestValue, _source: &String) {
+            let TestValue::Title(title) = value;
+            self.0.push(title.clone());
+        }
+
+        fn retract(&mut self, value: &TestValue, _source: &String) {
+            let TestValue::Title(title) = value;
+            self.0.retain(|t| t != title);
+        }
+    }
+
+    fn fact(entity: &str, title: &str, operation: Operation) -> Fact<String, TestValue, String> {
+        Fact::new(
+            entity.to_string(),
+            TestValue::Title(title.to_string()),
+            Utc::now(),
+            "test".to_string(),
+            operation,
+        )
+    }
+
+    #[test]
+    fn aggregate_facts_folds_asserts_and_retracts_per_entity() {
+        let facts = vec![
+            fact("a", "one", Operation::Assert),
+            fact("b", "two", Operation::Assert),
+            fact("a", "three", Operation::Assert),
+            fact("a", "one", Operation::Retract),
+        ];
+
+        let aggregates: HashMap<String, Titles> = aggregate_facts(facts);
+
+        assert_eq!(aggregates["a"].0, vec!["three".to_string()]);
+        assert_eq!(aggregates["b"].0, vec!["two".to_string()]);
+    }
+
+    #[test]
+    fn value_format_is_tagged() {
+        assert_fact_value_format!(TestValue::Title("x".to_string()));
+    }
 }
