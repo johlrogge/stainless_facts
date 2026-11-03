@@ -14,8 +14,10 @@ rust-version = "1.85"
 
 [features]
 default = []
-# Enable async I/O with tokio (sync I/O always available)
-tokio = ["dep:tokio"]
+# Enable FactStore and synchronous file I/O
+io = ["dep:fs2", "dep:parking_lot"]
+# Enable async I/O with tokio (implies io)
+tokio = ["io", "dep:tokio"]
 
 [dependencies]
 # Core dependencies (always included)
@@ -24,9 +26,9 @@ chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 thiserror = "1.0"
 
-# Sync I/O dependencies (always included)
-fs2 = "0.4"
-parking_lot = "0.12"
+# Sync I/O dependencies (only with io feature)
+fs2 = { version = "0.4", optional = true }
+parking_lot = { version = "0.12", optional = true }
 
 # Async I/O dependencies (only with tokio feature)
 tokio = { version = "1", features = ["fs", "io-util", "time", "rt-multi-thread", "macros"], optional = true }
@@ -44,9 +46,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
 name = "basic_usage"
+required-features = ["io"]
 
 [[example]]
 name = "incremental_sync"
+required-features = ["io"]
 
 [[example]]
 name = "async_basic_usage"
