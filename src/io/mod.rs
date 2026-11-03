@@ -16,6 +16,9 @@ mod asyncio;
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use asyncio::{AsyncFactStreamReader, AsyncFactStreamWriter};
 
+#[cfg(test)]
+mod tests;
+
 use std::time::Duration;
 use thiserror::Error;
 
