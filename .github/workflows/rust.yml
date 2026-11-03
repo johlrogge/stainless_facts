@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, beta, nightly, 1.85.0]
+        rust: [stable, beta, nightly, 1.99.0]
         features:
           - { name: core, flags: "" }
           - { name: io, flags: "--features io" }
