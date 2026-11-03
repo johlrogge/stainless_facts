@@ -317,36 +317,72 @@ Key benefits:
 - **Validation**: Required fields enforced at build time
 - **Single clone**: Data cloned only once when building final output
 
-## Unknown Attributes
+### Seeing the Whole Fact with `apply`
 
-The system handles unknown attributes gracefully using `serde_json::Value`:
+`FactAggregator::apply(&Fact)` is the one hook every fold calls per fact. The default dispatches to `assert`/`retract`; override it when you need the timestamp or entity (`assert` and `retract` stay required):
 
 ```rust
-use stainless_facts::UnknownAttribute;
-use serde_json::Value as JsonValue;
-
-// When deserializing encounters an unknown attribute type:
-let unknown_fact: Fact<String, UnknownAttribute, String> =
-    serde_json::from_str(r#"["track1",{"t":"NewAttribute","v":42},"2024-01-15T10:00:00Z","alice","Assert"]"#)
-    .unwrap();
-
-// Access the unknown attribute
-assert_eq!(unknown_fact.value().t, "NewAttribute");
-assert_eq!(unknown_fact.value().v, JsonValue::Number(42.into()));
+fn apply(&mut self, fact: &Fact<String, MusicValue, String>) {
+    if let MusicValue::Bpm(bpm) = fact.value() {
+        if fact.operation() == Operation::Assert {
+            self.bpm = Some((*bpm, *fact.timestamp()));
+        }
+    }
+}
 ```
 
-Implement the optional methods to handle unknown attributes:
+### Incremental Folding
+
+`aggregate_facts_into` folds new facts into an existing map and returns the touched set: the keys it inserted, changed or removed. A retract against an unknown entity is a no-op (no entry, not touched). Folding a suffix into the fold of a prefix gives the same map as folding everything. `retain_touched` then sweeps only those keys:
 
 ```rust
+use stainless_facts::{aggregate_facts_into, retain_touched};
+
+let mut tracks: HashMap<String, Track> = HashMap::new();
+let touched = aggregate_facts_into(&mut tracks, new_facts);
+
+// Drop touched tracks that ended up without a title
+retain_touched(&mut tracks, &touched, |_key, track| track.title.is_some());
+```
+
+Override `FactAggregator::is_retired` to remove an aggregate automatically when a retract leaves it empty. Its key stays in the touched set, and a later assert recreates it.
+
+### Keyed Init
+
+`aggregate_facts_into_with` builds new entities from their key instead of `Default`, so `A` needs no `Default` impl:
+
+```rust
+let touched = aggregate_facts_into_with(&mut tracks, new_facts, |id: &String| Track::new(id));
+```
+
+`init` runs only when an assert reaches an entity not in the map.
+
+## Unknown Attributes (Schema Evolution)
+
+A reader whose value enum predates a newer writer would fail to deserialize the new attributes. Read the stream as `OpenFact<E, V, S>` instead: an attribute `V` cannot decode becomes `Attr::Unknown(UnknownAttribute { t, v })` (a missing `v` is `null`) rather than an error. This includes a known tag whose payload changed type; deserialize plain `Fact` if you want that to be an error. Anything that is not an object with a string `t` is still an error.
+
+Fold open facts with `aggregate_open_facts_into` (or `aggregate_open_facts_into_with` for keyed init). Known facts go to `apply`; unknown ones go to `apply_unknown`, which by default calls `assert_unknown`/`retract_unknown`:
+
+```rust
+use stainless_facts::{aggregate_open_facts_into, FactAggregator, OpenFact};
+use serde_json::Value as JsonValue;
+
 impl FactAggregator<String, MusicValue, String> for Track {
     // ... assert/retract implementations ...
 
     fn assert_unknown(&mut self, attribute: &str, value: &JsonValue, _source: &String) {
-        println!("Unknown attribute '{}' with value: {:?}", attribute, value);
-        // Optionally store in a HashMap<String, JsonValue> field
+        self.unknown.push((attribute.to_owned(), value.clone()));
     }
 }
+
+let line = r#"["track1",{"t":"Rating","v":5},"2024-01-15T10:00:00Z","alice","Assert"]"#;
+let fact: OpenFact<String, MusicValue, String> = serde_json::from_str(line)?;
+
+let mut tracks: HashMap<String, Track> = HashMap::new();
+aggregate_open_facts_into(&mut tracks, vec![fact]);
 ```
+
+Override `apply_unknown(&Fact<E, UnknownAttribute, S>)` if you need the timestamp or entity of an unknown fact. Unknown facts follow the same entity, touched-set and `is_retired` rules as known ones. Parsing lines needs only `serde_json`; reading them from a file via `FactStreamReader` requires the `io` feature.
 
 ## Cardinality Patterns
 
