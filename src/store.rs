@@ -187,7 +187,7 @@ where
         // Read through file, keeping track of last timestamp
         // This is O(n) but only done once at startup
         while reader.read_line(&mut line).map_err(ReadError::from)? > 0 {
-            if let Ok(fact) = serde_json::from_str::<Fact<E, V, S>>(&line) {
+            if let Ok(fact) = Fact::<E, V, S>::from_line(&line) {
                 last_timestamp = Some(*fact.timestamp());
             }
             line.clear();
@@ -250,7 +250,7 @@ where
             }
 
             // Parse fact
-            let fact: Fact<E, V, S> = serde_json::from_str(&self.line_buffer).ok()?;
+            let fact: Fact<E, V, S> = Fact::from_line(&self.line_buffer).ok()?;
 
             // If we haven't found starting point yet, check timestamp
             if !self.found_starting_point {

@@ -3,8 +3,9 @@ use serde::Serialize;
 
 /// Serialize a batch of facts to a buffer.
 ///
-/// All facts are serialized as newline-delimited JSON. Newlines within
-/// fact values are automatically escaped by serde_json.
+/// Each fact is encoded with the shared line codec ([`Fact::to_line`] plus
+/// `'\n'`), so the output is byte-identical to the public codec by
+/// construction. Newlines within fact values are escaped by JSON.
 pub(crate) fn serialize_batch<E, V, S>(
     facts: &[Fact<E, V, S>],
 ) -> Result<Vec<u8>, serde_json::Error>
@@ -16,8 +17,7 @@ where
     let mut buffer = Vec::new();
 
     for fact in facts {
-        serde_json::to_writer(&mut buffer, fact)?;
-        buffer.push(b'\n');
+        fact.encode_into(&mut buffer)?;
     }
 
     Ok(buffer)

@@ -166,6 +166,66 @@ fn sync_write_fails_when_file_is_exclusively_locked() {
     FileExt::unlock(&holder).unwrap();
 }
 
+#[test]
+fn writer_output_is_byte_identical_to_to_line_plus_newline() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+
+    let facts = vec![
+        fact(
+            "track1",
+            TestValue::Bpm(12800),
+            "2024-01-15T10:00:00Z",
+            "alice",
+        ),
+        fact(
+            "track2",
+            TestValue::Description("Line 1\nLine 2\r\nLine 3".to_string()),
+            "2024-01-15T10:01:00Z",
+            "bob",
+        ),
+    ];
+
+    {
+        let mut writer = FactStreamWriter::open(path).unwrap();
+        writer.write_batch(&facts).unwrap();
+    }
+
+    let expected: String = facts
+        .iter()
+        .map(|f| format!("{}\n", f.to_line().unwrap()))
+        .collect();
+    assert_eq!(std::fs::read(path).unwrap(), expected.into_bytes());
+
+    // And every written line reads back through `from_line`.
+    let text = std::fs::read_to_string(path).unwrap();
+    let decoded: Vec<Fact<String, TestValue, String>> =
+        text.lines().map(|l| Fact::from_line(l).unwrap()).collect();
+    assert_eq!(decoded, facts);
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_writer_output_is_byte_identical_to_to_line_plus_newline() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+
+    let facts = vec![fact(
+        "track1",
+        TestValue::Title("A\nB".to_string()),
+        "2024-01-15T10:00:00Z",
+        "alice",
+    )];
+
+    {
+        let mut writer = AsyncFactStreamWriter::open(path).await.unwrap();
+        writer.write_batch(&facts).await.unwrap();
+    }
+
+    let expected = format!("{}\n", facts[0].to_line().unwrap());
+    assert_eq!(std::fs::read(path).unwrap(), expected.into_bytes());
+}
+
 #[cfg(feature = "tokio")]
 #[tokio::test]
 async fn async_round_trip_single_fact() {

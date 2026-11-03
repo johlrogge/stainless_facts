@@ -10,6 +10,10 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// Line codec (storage format) - core, no feature needed
+mod codec;
+pub use codec::peek_entity;
+
 // Sync I/O - only with io feature
 #[cfg(feature = "io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "io")))]

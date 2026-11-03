@@ -153,7 +153,7 @@ where
                         continue; // Skip empty lines
                     }
 
-                    match serde_json::from_str(trimmed) {
+                    match Fact::from_line(trimmed) {
                         Ok(fact) => return Some(Ok(fact)),
                         Err(e) => return Some(Err(ReadError::Deserialization(e))),
                     }
