@@ -22,26 +22,26 @@ Facts are aggregated into useful data structures using the `FactAggregator` trai
 - **Core Fact System**: Immutable, timestamped facts with assert/retract operations
 - **Aggregation**: Build domain models from fact streams using `FactAggregator`
 - **Zero-Copy Capable**: Builder pattern for efficient aggregation with `Buildable` trait
-- **I/O Support** (optional): Thread-safe fact storage with `FactStore`
+- **I/O Support** (optional, `io` feature): Thread-safe fact storage with `FactStore`
 - **Incremental Sync**: Efficiently iterate from any timestamp for distributed systems
-- **Async Support** (optional): Tokio-based async readers/writers
+- **Async Support** (optional, `tokio` feature): Tokio-based async readers/writers
 - **Schema Evolution**: Graceful handling of unknown attributes
 - **Time Travel**: Query historical state by filtering facts
 - **Audit Trail**: Complete history of all changes
 
 ## Optional Features
 
-By default, stainless-facts provides only the core fact types and aggregation logic with no I/O dependencies.
+By default (`default = []`), stainless-facts provides only the core fact types and aggregation logic. The core depends only on `serde`, `serde_json`, `chrono` and `thiserror`, and builds for `wasm32-unknown-unknown`.
 
 Enable additional features as needed:
 
-- **`io`**: Enables `FactStore` and synchronous file I/O (adds `fs2` and `parking_lot` dependencies)
-- **`tokio`**: Enables async I/O with tokio (implies `io` feature)
+- **`io`**: Enables `FactStore`, `FactStreamReader`/`FactStreamWriter` (and their error types) and synchronous file I/O (adds `fs2` and `parking_lot` dependencies)
+- **`tokio`**: Enables async I/O with tokio (implies `io`)
 
 ```toml
 # Cargo.toml
 
-# Core only (no I/O)
+# Core only (no file I/O)
 stainless-facts = "0.2"
 
 # With synchronous I/O
@@ -56,6 +56,9 @@ stainless-facts = { version = "0.2", features = ["tokio"] }
 ```toml
 [dependencies]
 stainless-facts = "0.2"
+
+# To use FactStore or the stream reader/writer:
+# stainless-facts = { version = "0.2", features = ["io"] }
 ```
 
 ## Serialization Contract
@@ -196,7 +199,7 @@ fn main() {
 
 ## Using FactStore
 
-When you enable the `io` feature, you can use `FactStore` for persistent, thread-safe fact storage with incremental synchronization:
+`FactStore` requires the `io` feature (`stainless-facts = { version = "0.2", features = ["io"] }`), as do the examples in this section and the sync and thread-safety sections below; only the line codec works without it. It provides persistent, thread-safe fact storage with incremental synchronization:
 
 ```rust
 use stainless_facts::{Fact, FactStore, Operation};
@@ -225,26 +228,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     store.append(fact)?;
     
-    // Incremental sync - only read facts since last sync
-    let last_sync = "2024-01-15T00:00:00Z".parse()?;
-    for fact in store.iter_from(last_sync) {
-        println!("New fact: {:?}", fact);
+    // Time-travel query - facts at or after a timestamp.
+    // Items are `Result<Fact, ReadError>`: a malformed line or I/O error is
+    // yielded as an `Err`, not silently treated as the end of the stream.
+    let since = "2024-01-15T00:00:00Z".parse()?;
+    for fact in store.iter_from(since) {
+        let fact = fact?;
+        println!("Fact: {:?}", fact);
     }
     
     Ok(())
 }
 ```
 
+`iter_from` scans the file from the start and compares timestamps; it is not a sync mechanism. To sync, use `StreamPosition` (below).
+
+### Syncing with StreamPosition (`io`)
+
+Timestamps are not unique (a batch shares one), so they cannot mark where you stopped. A `StreamPosition` is an opaque byte position of the next unread line. `append`, `append_batch` and `FactStreamWriter::write_batch` return the position just past what they wrote; it is `Serialize`/`Deserialize`, so you can persist it:
+
+```rust
+use stainless_facts::StreamPosition;
+
+// Writing returns the position after the written lines
+let position: StreamPosition = store.append(fact)?;
+let saved = serde_json::to_string(&position)?;   // persist wherever you like
+
+// Later: resume exactly after that position
+let position: StreamPosition = serde_json::from_str(&saved)?;
+let mut reader = store.read_at(position)?;
+for fact in &mut reader {
+    let fact = fact?;
+    // apply fact...
+}
+let saved = reader.position();                   // position after the last complete line
+```
+
+`StreamPosition::START` reads from the beginning. A position past the end of the file, or not on a line boundary, fails with `ReadError::InvalidPosition`. `AsyncFactStore::read_at` is the async twin (`tokio` feature).
+
+Relays that forward lines without decoding them can use `read_lines_at(path, position, limit)` (`read_lines_at_async` with `tokio`), which returns up to `limit` raw lines and the position for the next page:
+
+```rust
+let (lines, next) = stainless_facts::read_lines_at("data.facts", position, 500)?;
+```
+
+### Line codec
+
+The storage format is owned by the crate. `Fact::to_line`, `Fact::from_line` and `peek_entity` are available in core (no `io` feature) and match what the stream writers produce:
+
+```rust
+let line: String = fact.to_line()?;                       // one line, no trailing '\n'
+let fact: Fact<String, MyValue, String> = Fact::from_line(&line)?;
+let entity: String = stainless_facts::peek_entity(&line)?; // decodes only the entity
+```
+
+`peek_entity` works without knowing the line's value type, for example to route lines by entity.
+
 ### Thread Safety
 
-`FactStore` uses read-write locks for concurrent access:
-- Multiple readers can iterate simultaneously
-- Writers acquire exclusive locks via file locking
-- Timestamp ordering is enforced atomically
+Reads never block writes:
+- Readers take no locks and yield only complete (newline-terminated) lines, so a line still being appended is left for the next read
+- Writers take an exclusive file lock for the duration of each write and release it afterwards
+- `FactStore` also holds a mutex around appends, so the timestamp-ordering check and the write are atomic across threads
+- A write waits up to 5 s (`DEFAULT_LOCK_TIMEOUT`) for the lock before failing; change it with `FactStore::with_lock_timeout(Duration)` and read it with `lock_timeout()`
+- Windows caveat: file locks there are mandatory (`LockFileEx`), so a read that overlaps a write can block or fail; on Unix they are advisory and readers are never blocked
 
 ### Timestamp Ordering
 
-`FactStore` enforces strict timestamp ordering. Facts with timestamps older than the latest fact in the store will be rejected:
+`FactStore` enforces timestamp ordering. A batch is rejected as a whole, with nothing written, if any fact is older than the latest fact in the store or older than the fact before it in the same batch. Equal timestamps are allowed:
 
 ```rust
 // This will fail if facts are out of order
@@ -314,36 +365,72 @@ Key benefits:
 - **Validation**: Required fields enforced at build time
 - **Single clone**: Data cloned only once when building final output
 
-## Unknown Attributes
+### Seeing the Whole Fact with `apply`
 
-The system handles unknown attributes gracefully using `serde_json::Value`:
+`FactAggregator::apply(&Fact)` is the one hook every fold calls per fact. The default dispatches to `assert`/`retract`; override it when you need the timestamp or entity (`assert` and `retract` stay required):
 
 ```rust
-use stainless_facts::UnknownAttribute;
-use serde_json::Value as JsonValue;
-
-// When deserializing encounters an unknown attribute type:
-let unknown_fact: Fact<String, UnknownAttribute, String> =
-    serde_json::from_str(r#"["track1",{"t":"NewAttribute","v":42},"2024-01-15T10:00:00Z","alice","Assert"]"#)
-    .unwrap();
-
-// Access the unknown attribute
-assert_eq!(unknown_fact.value().t, "NewAttribute");
-assert_eq!(unknown_fact.value().v, JsonValue::Number(42.into()));
+fn apply(&mut self, fact: &Fact<String, MusicValue, String>) {
+    if let MusicValue::Bpm(bpm) = fact.value() {
+        if fact.operation() == Operation::Assert {
+            self.bpm = Some((*bpm, *fact.timestamp()));
+        }
+    }
+}
 ```
 
-Implement the optional methods to handle unknown attributes:
+### Incremental Folding
+
+`aggregate_facts_into` folds new facts into an existing map and returns the touched set: every key at least one fact was dispatched to, a superset of the keys whose state changed. Keys not in the set are guaranteed unchanged. A retract against an unknown entity is a no-op (no entry, not touched). Folding a suffix into the fold of a prefix gives the same map as folding everything. `retain_touched` then sweeps only those keys:
 
 ```rust
+use stainless_facts::{aggregate_facts_into, retain_touched};
+
+let mut tracks: HashMap<String, Track> = HashMap::new();
+let touched = aggregate_facts_into(&mut tracks, new_facts);
+
+// Drop touched tracks that ended up without a title
+retain_touched(&mut tracks, &touched, |_key, track| track.title.is_some());
+```
+
+Override `FactAggregator::is_retired` to remove an aggregate automatically when a retract leaves it empty. Its key stays in the touched set, and a later assert recreates it.
+
+### Keyed Init
+
+`aggregate_facts_into_with` builds new entities from their key instead of `Default`, so `A` needs no `Default` impl:
+
+```rust
+let touched = aggregate_facts_into_with(&mut tracks, new_facts, |id: &String| Track::new(id));
+```
+
+`init` runs only when an assert reaches an entity not in the map.
+
+## Unknown Attributes (Schema Evolution)
+
+A reader whose value enum predates a newer writer would fail to deserialize the new attributes. Read the stream as `OpenFact<E, V, S>` instead: an attribute `V` cannot decode becomes `Attr::Unknown(UnknownAttribute { t, v })` (a missing `v` is `null`, and is re-emitted as `"v":null`) rather than an error. This includes a known tag whose payload changed type; deserialize plain `Fact` if you want that to be an error. Anything that is not an object with a string `t` and no keys other than `t` and `v` is still an error.
+
+Fold open facts with `aggregate_open_facts_into` (or `aggregate_open_facts_into_with` for keyed init). Known facts go to `apply`; unknown ones go to `apply_unknown`, which by default calls `assert_unknown`/`retract_unknown`:
+
+```rust
+use stainless_facts::{aggregate_open_facts_into, FactAggregator, OpenFact};
+use serde_json::Value as JsonValue;
+
 impl FactAggregator<String, MusicValue, String> for Track {
     // ... assert/retract implementations ...
 
     fn assert_unknown(&mut self, attribute: &str, value: &JsonValue, _source: &String) {
-        println!("Unknown attribute '{}' with value: {:?}", attribute, value);
-        // Optionally store in a HashMap<String, JsonValue> field
+        self.unknown.push((attribute.to_owned(), value.clone()));
     }
 }
+
+let line = r#"["track1",{"t":"Rating","v":5},"2024-01-15T10:00:00Z","alice","Assert"]"#;
+let fact: OpenFact<String, MusicValue, String> = serde_json::from_str(line)?;
+
+let mut tracks: HashMap<String, Track> = HashMap::new();
+aggregate_open_facts_into(&mut tracks, vec![fact]);
 ```
+
+Override `apply_unknown(&Fact<E, UnknownAttribute, S>)` if you need the timestamp or entity of an unknown fact. Unknown facts follow the same entity, touched-set and `is_retired` rules as known ones. Parsing lines needs only `serde_json`; reading them from a file via `FactStreamReader` requires the `io` feature.
 
 ## Cardinality Patterns
 

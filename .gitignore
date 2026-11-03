@@ -1,1 +1,13 @@
 /target
+/.devenv
+/.devenv.flake.nix
+/.direnv
+/.mcp.json
+/.claude/settings.json
+/.claude/settings.local.json
+/.claude/skills/
+/.claude/agents/
+/.claude/commands/
+
+# Files written by running the examples
+/*.facts

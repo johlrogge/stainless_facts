@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut iter = store.iter().await;
     let mut count = 0;
     while let Some(fact) = iter.next().await {
+        let fact = fact?;
         println!("  {:?}", fact);
         count += 1;
     }
