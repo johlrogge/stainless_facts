@@ -139,29 +139,44 @@ where
 
     /// Append a batch of facts, enforcing timestamp ordering.
     ///
-    /// All facts are written atomically. If any fact violates timestamp ordering,
-    /// the entire batch is rejected.
+    /// If any fact violates timestamp ordering, the entire batch is
+    /// rejected. Otherwise the facts are appended contiguously under the
+    /// exclusive lock; this is not atomic for concurrent readers (they may
+    /// observe a prefix) or across a crash (a torn tail is repaired by the
+    /// next writer). See [`AsyncFactStreamWriter::write_batch`].
     ///
     /// Returns the position just past the batch, as returned by
     /// [`AsyncFactStreamWriter::write_batch`]. Pass it to
     /// [`read_at`](Self::read_at) to read only what was appended later. An
-    /// empty batch writes nothing and returns the current end of the stream.
+    /// empty batch writes no facts and returns the current end of the
+    /// stream, taken under the exclusive lock (waiting for it like any
+    /// append) after repairing a torn tail, so it is always a valid
+    /// position for [`read_at`](Self::read_at). If the store's file does
+    /// not exist yet, an empty batch returns [`StreamPosition::START`]
+    /// without creating it.
     pub async fn append_batch(
         &self,
         facts: &[Fact<E, V, S>],
     ) -> Result<StreamPosition, StoreError> {
-        if facts.is_empty() {
-            return match tokio::fs::metadata(&self.path).await {
-                Ok(metadata) => Ok(StreamPosition::from_offset(metadata.len())),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StreamPosition::START),
-                Err(e) => Err(e.into()),
-            };
-        }
-
         // Held across the check, the write and the cache update, so that
         // concurrent appends cannot pass the check and then write out of
         // order.
         let mut latest = self.latest_timestamp.lock().await;
+
+        if facts.is_empty() {
+            // The end is taken under the file lock, after repairing a torn
+            // tail, so it is a line boundary. A missing file is not created.
+            return match tokio::fs::metadata(&self.path).await {
+                Ok(_) => {
+                    let mut writer =
+                        AsyncFactStreamWriter::open_with_timeout(&self.path, self.lock_timeout)
+                            .await?;
+                    Ok(writer.end_position().await?)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StreamPosition::START),
+                Err(e) => Err(e.into()),
+            };
+        }
 
         if let Some(latest_ts) = *latest {
             for fact in facts {
@@ -215,7 +230,9 @@ where
 
     /// Get the latest timestamp in the store.
     ///
-    /// Waits for an append in progress to finish.
+    /// Waits for an append in progress through this store to finish. That
+    /// append may itself be waiting for another writer's file lock, so this
+    /// can take up to the store's [`lock_timeout`](Self::lock_timeout).
     pub async fn latest_timestamp(&self) -> Option<DateTime<Utc>> {
         *self.latest_timestamp.lock().await
     }
@@ -577,6 +594,52 @@ mod tests {
         );
         let after = store.append_batch(&create_test_facts()).await.unwrap();
         assert_eq!(store.append_batch(&[]).await.unwrap(), after);
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_batch_on_torn_tail_returns_a_readable_position() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        store.append(a.clone()).await.unwrap();
+        {
+            // A crashed writer left half a line behind.
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap();
+            file.write_all(br#"{"e":"torn"#).unwrap();
+        }
+
+        let end = store.append_batch(&[]).await.unwrap();
+        assert_eq!(
+            end,
+            StreamPosition::from_offset(std::fs::metadata(temp.path()).unwrap().len())
+        );
+        assert!(store.read_at(end).await.unwrap().next().await.is_none());
+
+        let b = count_fact(2, at("10:01:00"));
+        store.append(b.clone()).await.unwrap();
+        assert_eq!(
+            collect_reader(store.read_at(end).await.unwrap()).await,
+            vec![b]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_batch_on_missing_file_does_not_create_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.stream");
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(&path).await.unwrap();
+
+        assert_eq!(
+            store.append_batch(&[]).await.unwrap(),
+            StreamPosition::START
+        );
+        assert!(!path.exists());
     }
 
     #[tokio::test]

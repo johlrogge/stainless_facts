@@ -1,12 +1,13 @@
-use super::{common, ReadError, WriteError};
+use super::common;
+use super::{ReadError, WriteError};
 use crate::{Fact, StreamPosition};
-use fs2::FileExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, SeekFrom};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
 /// Appends batches of facts to a fact stream file asynchronously.
 ///
@@ -15,16 +16,20 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufR
 /// The same as [`FactStreamWriter`](crate::FactStreamWriter): each
 /// [`write_batch`](Self::write_batch) takes an exclusive advisory file lock
 /// (via `fs2`) for the duration of the write, which serializes writers to
-/// the same file, including writers in other processes. While another
-/// writer holds the lock, the write waits with `tokio::time::sleep`
-/// between attempts. Readers take no lock.
+/// the same file, including writers in other processes. Readers take no
+/// lock.
+///
+/// The whole locked section (waiting for the lock, the write, fsync and
+/// releasing the lock) runs as one task on tokio's blocking thread pool.
+/// While another writer holds the lock, that task waits on its blocking
+/// thread, not on the async runtime.
 ///
 /// On Windows, the lock is taken with `LockFileEx`, which is *mandatory*
 /// locking: while a write is in progress, reads of the file can block or
 /// fail.
 pub struct AsyncFactStreamWriter {
-    sync_file: std::fs::File, // For locking
-    file: File,
+    /// Shared with the blocking task that does each locked write.
+    file: Arc<std::fs::File>,
     lock_timeout: Duration,
 }
 
@@ -47,51 +52,39 @@ impl AsyncFactStreamWriter {
         path: impl AsRef<Path>,
         timeout: Duration,
     ) -> Result<Self, WriteError> {
-        let path = path.as_ref();
-
-        // Open sync file for locking
-        let sync_file = std::fs::OpenOptions::new()
+        // Read access lets a writer check for a torn tail before appending.
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
-            .open(path)?;
-
-        // Convert to async file
-        let file = File::from_std(sync_file.try_clone()?);
+            .open(path)
+            .await?;
 
         Ok(Self {
-            sync_file,
-            file,
+            file: Arc::new(file.into_std().await),
             lock_timeout: timeout,
         })
     }
 
-    /// Acquire exclusive lock with configured timeout
-    async fn acquire_lock(&self) -> Result<(), WriteError> {
-        let start = Instant::now();
-        let retry_interval = Duration::from_millis(100);
-
-        loop {
-            match self.sync_file.try_lock_exclusive() {
-                Ok(()) => return Ok(()),
-                Err(_) if self.lock_timeout.is_zero() => {
-                    return Err(WriteError::AlreadyLocked);
-                }
-                Err(_) if start.elapsed() >= self.lock_timeout => {
-                    return Err(WriteError::LockTimeout(self.lock_timeout));
-                }
-                Err(_) => {
-                    tokio::time::sleep(retry_interval).await;
-                }
-            }
-        }
-    }
-
-    /// Write a batch of facts atomically.
+    /// Write a batch of facts.
     ///
-    /// Acquires exclusive lock, writes all facts, then releases lock.
     /// All facts are serialized to memory first. If serialization fails,
-    /// no facts are written. The batch is appended with a single write, and
-    /// fsync ensures durability.
+    /// no facts are written. The batch is then appended contiguously under
+    /// the exclusive lock, and fsync ensures durability. The append is not
+    /// atomic for concurrent readers (they may observe a prefix) or across
+    /// a crash (a torn tail is repaired by the next writer: if the file
+    /// ends in an unterminated line, a `'\n'` is written first, so the
+    /// fragment becomes a single malformed line that readers report and
+    /// skip).
+    ///
+    /// # Cancellation
+    ///
+    /// The batch is encoded before the first await. The locked section then
+    /// runs as a task on tokio's blocking thread pool, and that task always
+    /// runs to completion. If the returned future is dropped once the task
+    /// has started, the write is **not** cancelled: the batch is still
+    /// written in full, and the lock is released only after that. Dropping
+    /// the future only discards the result.
     ///
     /// Returns the position just past the last written line, taken under
     /// the write lock: the end of the stream once this batch is on disk.
@@ -107,26 +100,26 @@ impl AsyncFactStreamWriter {
         S: Serialize,
     {
         let buffer = common::serialize_batch(facts)?;
+        self.append_locked(buffer).await
+    }
 
-        // Acquire lock only for the duration of the write
-        self.acquire_lock().await?;
+    /// The current end of the stream, taken under the exclusive lock (so no
+    /// write is in progress) after repairing a torn tail. The result is a
+    /// line boundary. Like [`write_batch`](Self::write_batch), it runs to
+    /// completion once started, even if the future is dropped.
+    pub(crate) async fn end_position(&mut self) -> Result<StreamPosition, WriteError> {
+        self.append_locked(Vec::new()).await
+    }
 
-        let result = async {
-            self.file.write_all(&buffer).await?;
-            // tokio's `File` completes writes in the background; flush waits
-            // for this one to land before syncing.
-            self.file.flush().await?;
-            self.file.sync_all().await?;
-            Ok(StreamPosition::from_offset(
-                self.file.metadata().await?.len(),
-            ))
-        }
-        .await;
-
-        // Always release lock, even on error
-        let _ = FileExt::unlock(&self.sync_file);
-
-        result
+    /// Run [`common::append_locked`] on the blocking thread pool. The task
+    /// owns a handle to the file and the buffer, so it runs to completion
+    /// (and releases the lock) even if this future is dropped.
+    async fn append_locked(&mut self, buffer: Vec<u8>) -> Result<StreamPosition, WriteError> {
+        let file = Arc::clone(&self.file);
+        let timeout = self.lock_timeout;
+        tokio::task::spawn_blocking(move || common::append_locked(&file, timeout, buffer))
+            .await
+            .map_err(|e| WriteError::Io(io::Error::other(e)))?
     }
 }
 

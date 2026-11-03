@@ -481,6 +481,294 @@ fn sync_read_lines_at_rejects_invalid_position() {
     assert!(matches!(result, Err(ReadError::InvalidPosition(_))));
 }
 
+// ============================================================================
+// Write path: lock timeout, torn tails
+// ============================================================================
+
+/// An external handle holding the exclusive lock on `path`.
+fn external_lock(path: &std::path::Path) -> std::fs::File {
+    let holder = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    holder.try_lock_exclusive().unwrap();
+    holder
+}
+
+/// Each item from `path` as `Some(fact)`, or `None` for a line that failed
+/// to decode. Any other error fails the test.
+fn sync_outcomes(path: &std::path::Path) -> Vec<Option<TestFact>> {
+    FactStreamReader::<String, TestValue, String>::open(path)
+        .unwrap()
+        .map(|item| match item {
+            Ok(fact) => Some(fact),
+            Err(ReadError::Deserialization(_)) => None,
+            Err(e) => panic!("expected a decode error, got {e:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn sync_write_times_out_with_lock_timeout_when_lock_is_held() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let timeout = std::time::Duration::from_millis(100);
+    let mut writer = FactStreamWriter::open_with_timeout(path, timeout).unwrap();
+    let holder = external_lock(path);
+
+    let result = writer.write_batch(&[numbered(1)]);
+    assert!(
+        matches!(result, Err(WriteError::LockTimeout(t)) if t == timeout),
+        "expected LockTimeout, got {result:?}"
+    );
+
+    FileExt::unlock(&holder).unwrap();
+    // The failed attempt did not leave the lock held.
+    writer.write_batch(&[numbered(1)]).unwrap();
+}
+
+#[test]
+fn sync_write_after_torn_tail_keeps_the_new_batch_intact() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let first = numbered(1);
+    FactStreamWriter::open(path)
+        .unwrap()
+        .write_batch(std::slice::from_ref(&first))
+        .unwrap();
+    // A crashed writer left half a line behind.
+    append_raw(path, br#"{"e":"torn"#);
+
+    let batch = vec![numbered(2), numbered(3)];
+    let position = FactStreamWriter::open(path)
+        .unwrap()
+        .write_batch(&batch)
+        .unwrap();
+
+    assert_eq!(position, file_len(path));
+    assert_eq!(
+        sync_outcomes(path),
+        vec![
+            Some(first),
+            None,
+            Some(batch[0].clone()),
+            Some(batch[1].clone())
+        ]
+    );
+}
+
+#[cfg(feature = "tokio")]
+async fn async_outcomes(path: &std::path::Path) -> Vec<Option<TestFact>> {
+    let mut reader = AsyncFactStreamReader::<String, TestValue, String>::open(path)
+        .await
+        .unwrap();
+    let mut items = Vec::new();
+    while let Some(item) = reader.next().await {
+        items.push(match item {
+            Ok(fact) => Some(fact),
+            Err(ReadError::Deserialization(_)) => None,
+            Err(e) => panic!("expected a decode error, got {e:?}"),
+        });
+    }
+    items
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_write_times_out_with_lock_timeout_when_lock_is_held() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let timeout = std::time::Duration::from_millis(100);
+    let mut writer = AsyncFactStreamWriter::open_with_timeout(path, timeout)
+        .await
+        .unwrap();
+    let holder = external_lock(path);
+
+    let result = writer.write_batch(&[numbered(1)]).await;
+    assert!(
+        matches!(result, Err(WriteError::LockTimeout(t)) if t == timeout),
+        "expected LockTimeout, got {result:?}"
+    );
+
+    FileExt::unlock(&holder).unwrap();
+    writer.write_batch(&[numbered(1)]).await.unwrap();
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_write_after_torn_tail_keeps_the_new_batch_intact() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let first = numbered(1);
+    AsyncFactStreamWriter::open(path)
+        .await
+        .unwrap()
+        .write_batch(std::slice::from_ref(&first))
+        .await
+        .unwrap();
+    append_raw(path, br#"{"e":"torn"#);
+
+    let batch = vec![numbered(2), numbered(3)];
+    let position = AsyncFactStreamWriter::open(path)
+        .await
+        .unwrap()
+        .write_batch(&batch)
+        .await
+        .unwrap();
+
+    assert_eq!(position, file_len(path));
+    assert_eq!(
+        async_outcomes(path).await,
+        vec![
+            Some(first),
+            None,
+            Some(batch[0].clone()),
+            Some(batch[1].clone())
+        ]
+    );
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_write_batch_cancelled_while_waiting_for_the_lock_does_not_block_others() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let mut w1 = AsyncFactStreamWriter::open_with_timeout(path, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let holder = external_lock(path);
+
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        w1.write_batch(&[numbered(1)]),
+    )
+    .await;
+    assert!(cancelled.is_err(), "expected the write to still be waiting");
+
+    FileExt::unlock(&holder).unwrap();
+
+    // The started write is not abandoned: it takes the lock once it is
+    // free and lands. W2 waits for it rather than racing it.
+    let mut w2 = AsyncFactStreamWriter::open_with_timeout(path, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    w2.write_batch(&[numbered(2)]).await.unwrap();
+    // Either may have taken the lock first; wait (bounded) for both.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut written = loop {
+        let written = async_read_all_at(path, StreamPosition::START).await;
+        if written.len() >= 2 || std::time::Instant::now() >= deadline {
+            break written;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    written.sort_by_key(|f| f.entity().clone());
+    assert_eq!(written, vec![numbered(1), numbered(2)]);
+    // W1 is still alive: its handle must not be holding the lock.
+    let other = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    other.try_lock_exclusive().expect("lock still held");
+    FileExt::unlock(&other).unwrap();
+    drop(w1);
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_write_futures_are_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    let temp = NamedTempFile::new().unwrap();
+    let mut writer = AsyncFactStreamWriter::open(temp.path()).await.unwrap();
+    let batch = vec![numbered(1)];
+    {
+        let write = writer.write_batch(&batch);
+        assert_send(&write);
+    }
+    let end = writer.end_position();
+    assert_send(&end);
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_write_batch_cancelled_after_acquiring_the_lock_releases_it() {
+    use std::future::Future as _;
+    use std::task::{Context, Waker};
+
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let mut w1 = AsyncFactStreamWriter::open(path).await.unwrap();
+    let batch = vec![numbered(1)];
+
+    {
+        // One poll starts the write; the future is then dropped mid-write.
+        let mut write = Box::pin(w1.write_batch(&batch));
+        let mut cx = Context::from_waker(Waker::noop());
+        let _ = write.as_mut().poll(&mut cx);
+    }
+
+    // The started write runs to completion and then releases the lock.
+    let other = wait_for_lock_after_write(path).await;
+    FileExt::unlock(&other).unwrap();
+
+    let mut w2 = AsyncFactStreamWriter::open(path).await.unwrap();
+    w2.write_batch(&[numbered(2)]).await.unwrap();
+    drop(w1);
+}
+
+/// Wait (bounded) until `path` is non-empty and a separate handle can take
+/// its exclusive lock, and return that handle, still holding the lock.
+#[cfg(feature = "tokio")]
+async fn wait_for_lock_after_write(path: &std::path::Path) -> std::fs::File {
+    let other = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(path).unwrap().len() > 0 && other.try_lock_exclusive().is_ok() {
+            return other;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cancelled write never completed and released the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_write_batch_dropped_after_first_poll_still_lands_completely() {
+    use std::future::Future as _;
+    use std::task::{Context, Waker};
+
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let mut w1 = AsyncFactStreamWriter::open(path).await.unwrap();
+    // Larger than tokio's background write chunk, so a write cut short
+    // after the first chunk would leave a torn batch.
+    let big = "x".repeat(1 << 20);
+    let batch: Vec<TestFact> = (0..4)
+        .map(|n| {
+            fact(
+                &format!("track{n}"),
+                TestValue::Description(big.clone()),
+                "2024-01-15T10:00:00Z",
+                "alice",
+            )
+        })
+        .collect();
+
+    {
+        let mut write = Box::pin(w1.write_batch(&batch));
+        let mut cx = Context::from_waker(Waker::noop());
+        let _ = write.as_mut().poll(&mut cx);
+    }
+
+    let other = wait_for_lock_after_write(path).await;
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(
+        bytes.last(),
+        Some(&b'\n'),
+        "torn tail after cancelled write"
+    );
+    assert_eq!(async_read_all_at(path, StreamPosition::START).await, batch);
+    FileExt::unlock(&other).unwrap();
+    drop(w1);
+}
+
 #[cfg(feature = "tokio")]
 async fn async_read_all_at(path: &std::path::Path, at: StreamPosition) -> Vec<TestFact> {
     let mut reader = AsyncFactStreamReader::open_at(path, at).await.unwrap();

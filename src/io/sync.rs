@@ -1,13 +1,13 @@
 // stainless_facts/src/io/sync.rs
 
-use super::{common, ReadError, WriteError};
+use super::common;
+use super::{ReadError, WriteError};
 use crate::{Fact, StreamPosition};
-use fs2::FileExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Appends batches of facts to a fact stream file.
 ///
@@ -47,40 +47,28 @@ impl FactStreamWriter {
         path: impl AsRef<Path>,
         timeout: Duration,
     ) -> Result<Self, WriteError> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        // Read access lets a writer check for a torn tail before appending.
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
         Ok(Self {
             file,
             lock_timeout: timeout,
         })
     }
 
-    /// Acquire exclusive lock with configured timeout
-    fn acquire_lock(&self) -> Result<(), WriteError> {
-        let start = Instant::now();
-        let retry_interval = Duration::from_millis(100);
-
-        loop {
-            match self.file.try_lock_exclusive() {
-                Ok(()) => return Ok(()),
-                Err(_) if self.lock_timeout.is_zero() => {
-                    return Err(WriteError::AlreadyLocked);
-                }
-                Err(_) if start.elapsed() >= self.lock_timeout => {
-                    return Err(WriteError::LockTimeout(self.lock_timeout));
-                }
-                Err(_) => {
-                    std::thread::sleep(retry_interval);
-                }
-            }
-        }
-    }
-
-    /// Write a batch of facts atomically.
+    /// Write a batch of facts.
     ///
-    /// Acquires exclusive lock, writes all facts, then releases lock.
     /// All facts are serialized to memory first. If serialization fails,
-    /// no facts are written. The batch is appended with a single write, and
-    /// fsync ensures durability.
+    /// no facts are written. The batch is then appended contiguously under
+    /// the exclusive lock, and fsync ensures durability. The append is not
+    /// atomic for concurrent readers (they may observe a prefix) or across
+    /// a crash (a torn tail is repaired by the next writer: if the file
+    /// ends in an unterminated line, a `'\n'` is written first, so the
+    /// fragment becomes a single malformed line that readers report and
+    /// skip).
     ///
     /// Returns the position just past the last written line, taken under
     /// the write lock: the end of the stream once this batch is on disk.
@@ -96,20 +84,14 @@ impl FactStreamWriter {
         S: Serialize,
     {
         let buffer = common::serialize_batch(facts)?;
+        common::append_locked(&self.file, self.lock_timeout, buffer)
+    }
 
-        // Acquire lock only for the duration of the write
-        self.acquire_lock()?;
-
-        let result = (|| {
-            self.file.write_all(&buffer)?;
-            self.file.sync_all()?;
-            Ok(StreamPosition::from_offset(self.file.metadata()?.len()))
-        })();
-
-        // Always release lock, even on error
-        let _ = FileExt::unlock(&self.file);
-
-        result
+    /// The current end of the stream, taken under the exclusive lock (so no
+    /// write is in progress) after repairing a torn tail. The result is a
+    /// line boundary.
+    pub(crate) fn end_position(&mut self) -> Result<StreamPosition, WriteError> {
+        common::append_locked(&self.file, self.lock_timeout, Vec::new())
     }
 }
 
@@ -290,8 +272,8 @@ where
 /// page. When no more complete lines are available, the lines are empty and
 /// the position is unchanged.
 ///
-/// No lock is taken: the stream's writer appends each batch with a single
-/// write, and only complete lines are read. As with [`FactStreamReader`],
+/// No lock is taken: the stream's writer appends each batch contiguously
+/// under its exclusive lock, and only complete lines are read. As with [`FactStreamReader`],
 /// a call that races a writer may return only a prefix of an in-progress
 /// batch, and the returned position is always on a line boundary.
 ///
