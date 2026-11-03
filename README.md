@@ -199,7 +199,7 @@ fn main() {
 
 ## Using FactStore
 
-`FactStore` requires the `io` feature (`stainless-facts = { version = "0.2", features = ["io"] }`). It provides persistent, thread-safe fact storage with incremental synchronization:
+`FactStore` requires the `io` feature (`stainless-facts = { version = "0.2", features = ["io"] }`), as do the examples in this section and the sync and thread-safety sections below; only the line codec works without it. It provides persistent, thread-safe fact storage with incremental synchronization:
 
 ```rust
 use stainless_facts::{Fact, FactStore, Operation};
@@ -228,26 +228,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     store.append(fact)?;
     
-    // Incremental sync - only read facts since last sync
-    let last_sync = "2024-01-15T00:00:00Z".parse()?;
-    for fact in store.iter_from(last_sync) {
-        println!("New fact: {:?}", fact);
+    // Time-travel query - facts at or after a timestamp.
+    // Items are `Result<Fact, ReadError>`: a malformed line or I/O error is
+    // yielded as an `Err`, not silently treated as the end of the stream.
+    let since = "2024-01-15T00:00:00Z".parse()?;
+    for fact in store.iter_from(since) {
+        let fact = fact?;
+        println!("Fact: {:?}", fact);
     }
     
     Ok(())
 }
 ```
 
+`iter_from` scans the file from the start and compares timestamps; it is not a sync mechanism. To sync, use `StreamPosition` (below).
+
+### Syncing with StreamPosition (`io`)
+
+Timestamps are not unique (a batch shares one), so they cannot mark where you stopped. A `StreamPosition` is an opaque byte position of the next unread line. `append`, `append_batch` and `FactStreamWriter::write_batch` return the position just past what they wrote; it is `Serialize`/`Deserialize`, so you can persist it:
+
+```rust
+use stainless_facts::StreamPosition;
+
+// Writing returns the position after the written lines
+let position: StreamPosition = store.append(fact)?;
+let saved = serde_json::to_string(&position)?;   // persist wherever you like
+
+// Later: resume exactly after that position
+let position: StreamPosition = serde_json::from_str(&saved)?;
+let mut reader = store.read_at(position)?;
+for fact in &mut reader {
+    let fact = fact?;
+    // apply fact...
+}
+let saved = reader.position();                   // position after the last complete line
+```
+
+`StreamPosition::START` reads from the beginning. A position past the end of the file, or not on a line boundary, fails with `ReadError::InvalidPosition`. `AsyncFactStore::read_at` is the async twin (`tokio` feature).
+
+Relays that forward lines without decoding them can use `read_lines_at(path, position, limit)` (`read_lines_at_async` with `tokio`), which returns up to `limit` raw lines and the position for the next page:
+
+```rust
+let (lines, next) = stainless_facts::read_lines_at("data.facts", position, 500)?;
+```
+
+### Line codec
+
+The storage format is owned by the crate. `Fact::to_line`, `Fact::from_line` and `peek_entity` are available in core (no `io` feature) and match what the stream writers produce:
+
+```rust
+let line: String = fact.to_line()?;                       // one line, no trailing '\n'
+let fact: Fact<String, MyValue, String> = Fact::from_line(&line)?;
+let entity: String = stainless_facts::peek_entity(&line)?; // decodes only the entity
+```
+
+`peek_entity` works without knowing the line's value type, for example to route lines by entity.
+
 ### Thread Safety
 
-`FactStore` uses read-write locks for concurrent access:
-- Multiple readers can iterate simultaneously
-- Writers acquire exclusive locks via file locking
-- Timestamp ordering is enforced atomically
+Reads never block writes:
+- Readers take no locks and yield only complete (newline-terminated) lines, so a line still being appended is left for the next read
+- Writers take an exclusive file lock for the duration of each write and release it afterwards
+- `FactStore` also holds a mutex around appends, so the timestamp-ordering check and the write are atomic across threads
+- A write waits up to 5 s (`DEFAULT_LOCK_TIMEOUT`) for the lock before failing; change it with `FactStore::with_lock_timeout(Duration)` and read it with `lock_timeout()`
+- Windows caveat: file locks there are mandatory (`LockFileEx`), so a read that overlaps a write can block or fail; on Unix they are advisory and readers are never blocked
 
 ### Timestamp Ordering
 
-`FactStore` enforces strict timestamp ordering. Facts with timestamps older than the latest fact in the store will be rejected:
+`FactStore` enforces timestamp ordering. A batch is rejected as a whole, with nothing written, if any fact is older than the latest fact in the store or older than the fact before it in the same batch. Equal timestamps are allowed:
 
 ```rust
 // This will fail if facts are out of order

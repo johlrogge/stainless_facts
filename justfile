@@ -144,7 +144,8 @@ doc:
 # build documentation without opening it
 [group('docs')]
 doc-check:
-    cargo doc --all-features --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 
 # === Cleanup ===
 

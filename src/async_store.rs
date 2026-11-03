@@ -1,42 +1,32 @@
-// stainless-facts: AsyncFactStore
-// =================================
-//
-// Add to: src/async_store.rs (new file)
-
-use crate::io::{AsyncFactStreamWriter, ReadError, WriteError};
-use crate::Fact;
+use crate::io::{AsyncFactStreamReader, AsyncFactStreamWriter, ReadError};
+use crate::store::{
+    check_batch_order, nothing_written, reader_open_error, SinceFilter, StoreError,
+    DEFAULT_LOCK_TIMEOUT,
+};
+use crate::{Fact, StreamPosition};
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
-use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
-
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Write error: {0}")]
-    Write(#[from] WriteError),
-
-    #[error("Read error: {0}")]
-    Read(#[from] ReadError),
-
-    #[error("Timestamp ordering violation: new fact at {new} is before latest {latest}")]
-    TimestampOrdering {
-        new: DateTime<Utc>,
-        latest: DateTime<Utc>,
-    },
-}
+use std::time::Duration;
 
 /// An async, thread-safe fact store that maintains timestamp ordering.
 ///
 /// The AsyncFactStore provides:
 /// - Thread-safe appending of facts with timestamp validation
-/// - Efficient async iteration from any timestamp
-/// - Read-write locking for concurrent access
+/// - Resumable reads from a [`StreamPosition`] with [`read_at`](Self::read_at)
+/// - Async iteration from any timestamp
 /// - Async file I/O with tokio
+///
+/// # Concurrency
+///
+/// The same as [`FactStore`](crate::FactStore): appends through one store
+/// are serialized by a `tokio::sync::Mutex` held across the timestamp
+/// check, the write and the cache update, so concurrent tasks cannot pass
+/// the check and then write out of order. Each write also takes the
+/// stream's exclusive file lock, waiting up to the store's lock timeout
+/// ([`DEFAULT_LOCK_TIMEOUT`](crate::store::DEFAULT_LOCK_TIMEOUT) unless set
+/// with [`with_lock_timeout`](Self::with_lock_timeout)) for writers in
+/// other processes. Readers take no lock.
 ///
 /// # Examples
 ///
@@ -70,6 +60,7 @@ pub enum StoreError {
 /// let since = "2024-01-15T00:00:00Z".parse()?;
 /// let mut iter = store.iter_from(since).await;
 /// while let Some(fact) = iter.next().await {
+///     let fact = fact?;
 ///     println!("{:?}", fact);
 /// }
 /// # Ok(())
@@ -77,8 +68,10 @@ pub enum StoreError {
 /// ```
 pub struct AsyncFactStore<E, V, S> {
     path: PathBuf,
-    /// Latest timestamp, cached for quick access
-    latest_timestamp: RwLock<Option<DateTime<Utc>>>,
+    /// Latest timestamp, cached for quick access. The guard is held for the
+    /// whole append, across `.await`, so it also serializes appends.
+    latest_timestamp: tokio::sync::Mutex<Option<DateTime<Utc>>>,
+    lock_timeout: Duration,
     _phantom: std::marker::PhantomData<(E, V, S)>,
 }
 
@@ -89,6 +82,10 @@ where
     S: Serialize + DeserializeOwned + Clone,
 {
     /// Open an existing fact store or create a new one.
+    ///
+    /// An existing file is scanned once for its latest timestamp. Lines
+    /// that fail to decode are skipped by that scan, so they do not prevent
+    /// opening the store; [`iter`](Self::iter) reports them as errors.
     pub async fn open_or_create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
 
@@ -106,157 +103,271 @@ where
 
         Ok(Self {
             path,
-            latest_timestamp: RwLock::new(latest_timestamp),
+            latest_timestamp: tokio::sync::Mutex::new(latest_timestamp),
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
             _phantom: std::marker::PhantomData,
         })
     }
 
+    /// Set how long an append waits for another writer's file lock before
+    /// failing with [`WriteError::LockTimeout`](crate::WriteError::LockTimeout).
+    ///
+    /// The default is [`DEFAULT_LOCK_TIMEOUT`](crate::store::DEFAULT_LOCK_TIMEOUT).
+    /// With [`Duration::ZERO`], an append fails at once with
+    /// [`WriteError::AlreadyLocked`](crate::WriteError::AlreadyLocked) if the
+    /// lock is held.
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+
+    /// How long an append waits for another writer's file lock.
+    pub fn lock_timeout(&self) -> Duration {
+        self.lock_timeout
+    }
+
     /// Append a single fact, enforcing timestamp ordering.
-    pub async fn append(&self, fact: Fact<E, V, S>) -> Result<(), StoreError> {
+    ///
+    /// Returns the position just past the written fact; see
+    /// [`append_batch`](Self::append_batch).
+    pub async fn append(&self, fact: Fact<E, V, S>) -> Result<StreamPosition, StoreError> {
         self.append_batch(&[fact]).await
     }
 
     /// Append a batch of facts, enforcing timestamp ordering.
     ///
-    /// All facts are written atomically. If any fact violates timestamp ordering,
-    /// the entire batch is rejected.
-    pub async fn append_batch(&self, facts: &[Fact<E, V, S>]) -> Result<(), StoreError> {
+    /// If any fact violates timestamp ordering, the entire batch is
+    /// rejected. Otherwise the facts are appended contiguously under the
+    /// exclusive lock; this is not atomic for concurrent readers (they may
+    /// observe a prefix) or across a crash (a torn tail is repaired by the
+    /// next writer). See [`AsyncFactStreamWriter::write_batch`].
+    ///
+    /// Returns the position just past the batch, as returned by
+    /// [`AsyncFactStreamWriter::write_batch`]. Pass it to
+    /// [`read_at`](Self::read_at) to read only what was appended later. An
+    /// empty batch writes no facts and returns the current end of the
+    /// stream, taken under the exclusive lock (waiting for it like any
+    /// append) after repairing a torn tail, so it is always a valid
+    /// position for [`read_at`](Self::read_at). If the store's file does
+    /// not exist yet, an empty batch returns [`StreamPosition::START`]
+    /// without creating it.
+    ///
+    /// The timestamps must be non-decreasing within the batch as well as
+    /// relative to the store's latest timestamp; equal timestamps are
+    /// allowed. Afterwards the latest timestamp is the batch's maximum.
+    ///
+    /// # Errors and the cached latest timestamp
+    ///
+    /// The same as [`FactStore::append_batch`](crate::FactStore::append_batch):
+    /// the cached latest timestamp is advanced to the batch's maximum
+    /// *before* the write, and rolled back only on errors that prove nothing
+    /// was written ([`WriteError::AlreadyLocked`](crate::WriteError::AlreadyLocked),
+    /// [`WriteError::LockTimeout`](crate::WriteError::LockTimeout),
+    /// [`WriteError::Serialization`](crate::WriteError::Serialization), or an
+    /// error opening the file). After any other error the cache stays
+    /// conservatively ahead.
+    ///
+    /// # Cancellation
+    ///
+    /// Not cancel-safe in the sense that a dropped future's batch may still
+    /// be written: once the write has started, it runs to completion (see
+    /// [`AsyncFactStreamWriter::write_batch`]). Ordering is preserved because
+    /// the cache is advanced first, so a later append earlier than the
+    /// dropped batch's maximum is rejected.
+    pub async fn append_batch(
+        &self,
+        facts: &[Fact<E, V, S>],
+    ) -> Result<StreamPosition, StoreError> {
+        // Held across the check, the write and the cache update, so that
+        // concurrent appends cannot pass the check and then write out of
+        // order.
+        let mut latest = self.latest_timestamp.lock().await;
+
         if facts.is_empty() {
-            return Ok(());
-        }
-
-        // Check timestamp ordering
-        let latest = *self.latest_timestamp.read();
-
-        for fact in facts {
-            if let Some(latest_ts) = latest {
-                if fact.timestamp() < &latest_ts {
-                    return Err(StoreError::TimestampOrdering {
-                        new: *fact.timestamp(),
-                        latest: latest_ts,
-                    });
+            // The end is taken under the file lock, after repairing a torn
+            // tail, so it is a line boundary. A missing file is not created.
+            return match tokio::fs::metadata(&self.path).await {
+                Ok(_) => {
+                    let mut writer =
+                        AsyncFactStreamWriter::open_with_timeout(&self.path, self.lock_timeout)
+                            .await?;
+                    Ok(writer.end_position().await?)
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StreamPosition::START),
+                Err(e) => Err(e.into()),
+            };
+        }
+
+        let previous = *latest;
+        let batch_max = check_batch_order(previous, facts)?;
+
+        // The writer takes the exclusive file lock for the write, waiting up
+        // to `lock_timeout` for writers in other processes.
+        let mut writer =
+            AsyncFactStreamWriter::open_with_timeout(&self.path, self.lock_timeout).await?;
+
+        // Advanced before the write, so the cache never falls behind the
+        // disk, even if this future is dropped while the write goes on;
+        // rolled back only if the write provably did not happen.
+        *latest = batch_max;
+        writer.write_batch(facts).await.map_err(|e| {
+            if nothing_written(&e) {
+                *latest = previous;
             }
-        }
+            e.into()
+        })
+    }
 
-        // Write facts (AsyncFactStreamWriter handles locking)
-        let mut writer = AsyncFactStreamWriter::open(&self.path).await?;
-        writer.write_batch(facts).await?;
-
-        // Update cached latest timestamp
-        if let Some(last_fact) = facts.last() {
-            let mut latest = self.latest_timestamp.write();
-            *latest = Some(*last_fact.timestamp());
-        }
-
-        Ok(())
+    /// Read the facts after position `at`.
+    ///
+    /// The async twin of [`FactStore::read_at`](crate::FactStore::read_at):
+    /// `at` is a position returned by [`append`](Self::append),
+    /// [`append_batch`](Self::append_batch) or a reader's
+    /// [`position`](AsyncFactStreamReader::position), or
+    /// [`StreamPosition::START`]. Every fact after it is delivered exactly
+    /// once. If the store's file does not exist yet, it is created empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::Read`] with [`ReadError::InvalidPosition`] if `at` is
+    ///   past the end of the stream or not at the start of a line.
+    /// - [`StoreError::Io`] if the file cannot be created or opened.
+    pub async fn read_at(
+        &self,
+        at: StreamPosition,
+    ) -> Result<AsyncFactStreamReader<E, V, S>, StoreError> {
+        // Make sure the file exists, without touching its contents.
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        AsyncFactStreamReader::open_at(&self.path, at)
+            .await
+            .map_err(reader_open_error)
     }
 
     /// Get the latest timestamp in the store.
-    pub fn latest_timestamp(&self) -> Option<DateTime<Utc>> {
-        *self.latest_timestamp.read()
+    ///
+    /// Waits for an append in progress through this store to finish. That
+    /// append may itself be waiting for another writer's file lock, so this
+    /// can take up to the store's [`lock_timeout`](Self::lock_timeout).
+    pub async fn latest_timestamp(&self) -> Option<DateTime<Utc>> {
+        *self.latest_timestamp.lock().await
     }
 
     /// Iterate over all facts in the store.
+    ///
+    /// Each item is a `Result`: a line that fails to decode is yielded as
+    /// an `Err` and iteration continues past it. See [`AsyncFactIterator`]
+    /// for the error and end-of-stream behaviour.
     pub async fn iter(&self) -> AsyncFactIterator<E, V, S> {
         self.iter_from(DateTime::<Utc>::MIN_UTC).await
     }
 
     /// Iterate over facts starting from a specific timestamp.
     ///
-    /// This efficiently seeks to the first fact at or after the given timestamp.
+    /// Yields facts from the first one at or after `since`. This is a
+    /// time-travel query, not a sync cursor: a whole batch shares one
+    /// timestamp, so resuming from the last timestamp seen re-delivers it.
+    /// To sync incrementally, keep a [`StreamPosition`] and use
+    /// [`read_at`](Self::read_at) instead.
+    ///
+    /// Items are `Result`s, as for [`iter`](Self::iter). A line that fails
+    /// to decode is yielded as an `Err` even before the start point, since
+    /// its timestamp is unknown.
     ///
     /// # Performance
     ///
-    /// Currently performs a linear scan from the start. For large fact streams,
-    /// consider adding an index file for faster seeking.
+    /// Performs a linear scan from the start of the stream.
     pub async fn iter_from(&self, since: DateTime<Utc>) -> AsyncFactIterator<E, V, S> {
-        AsyncFactIterator::new(self.path.clone(), since).await
+        AsyncFactIterator::new(&self.path, since).await
     }
 
-    /// Read the latest timestamp from the file without caching.
+    /// Read the latest (maximum) timestamp from the file without caching.
+    ///
+    /// The async twin of the sync store's scan: reads with an
+    /// [`AsyncFactStreamReader`], so an unterminated tail is ignored, skips
+    /// lines that fail to decode (including lines that are not valid
+    /// UTF-8), and fails on I/O errors.
     async fn read_latest_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>, StoreError> {
-        let file = tokio::fs::File::open(path).await?;
-        let mut reader = BufReader::new(file);
-
-        let mut last_timestamp = None;
-        let mut line = String::new();
-
-        // Read through file, keeping track of last timestamp
-        // This is O(n) but only done once at startup
-        while reader.read_line(&mut line).await? > 0 {
-            if let Ok(fact) = serde_json::from_str::<Fact<E, V, S>>(&line) {
-                last_timestamp = Some(*fact.timestamp());
+        let mut reader = AsyncFactStreamReader::<E, V, S>::open(path)
+            .await
+            .map_err(reader_open_error)?;
+        let mut latest = None;
+        while let Some(item) = reader.next().await {
+            match item {
+                Ok(fact) => latest = latest.max(Some(*fact.timestamp())),
+                Err(ReadError::Deserialization(_)) => continue,
+                Err(e) => return Err(e.into()),
             }
-            line.clear();
         }
-
-        Ok(last_timestamp)
+        Ok(latest)
     }
 }
 
-/// Async iterator over facts in a fact store.
+/// Async iterator over the facts in an [`AsyncFactStore`], returned by
+/// [`AsyncFactStore::iter`] and [`AsyncFactStore::iter_from`].
 ///
-/// Lazily reads facts from disk, yielding only those at or after the starting timestamp.
+/// The async twin of [`FactIterator`](crate::FactIterator), built on an
+/// [`AsyncFactStreamReader`], with the same behaviour:
+///
+/// - A line that fails to decode is yielded as
+///   `Err(`[`ReadError::Deserialization`]`)` and skipped, even before the
+///   starting timestamp is reached.
+/// - After an I/O error (`Err(`[`ReadError::Io`]`)`), [`next`](Self::next)
+///   returns `None` from then on.
+/// - If the store's file does not exist, the iterator is empty.
+/// - Any other error opening the file is yielded as the first item.
+///
+/// Like the reader, it is **not fused**: after `next` returns `None` at the
+/// end of the stream, it returns `Some` again once more facts are appended.
+/// To read a snapshot, stop at the first `None`. This does not apply after
+/// an I/O error or when the file was missing: then it stays empty.
 pub struct AsyncFactIterator<E, V, S> {
-    reader: BufReader<tokio::fs::File>,
-    since: DateTime<Utc>,
-    line_buffer: String,
-    found_starting_point: bool,
-    _phantom: std::marker::PhantomData<(E, V, S)>,
+    /// `None` once iteration has ended for good (missing file, or after an
+    /// I/O error).
+    reader: Option<AsyncFactStreamReader<E, V, S>>,
+    /// An error opening the file, yielded as the first item.
+    open_error: Option<ReadError>,
+    filter: SinceFilter,
 }
 
-impl<E, V, S> AsyncFactIterator<E, V, S>
-where
-    E: DeserializeOwned + Clone,
-    V: DeserializeOwned + Clone,
-    S: DeserializeOwned + Clone,
-{
-    async fn new(path: PathBuf, since: DateTime<Utc>) -> Self {
-        let file = tokio::fs::File::open(&path).await.ok();
-        let reader = file.map(BufReader::new).unwrap_or_else(|| {
-            // Return empty reader if file doesn't exist
-            // Use a never-ready file
-            BufReader::new(tokio::fs::File::from_std(
-                std::fs::File::open("/dev/null").unwrap(),
-            ))
-        });
-
+impl<E, V, S> AsyncFactIterator<E, V, S> {
+    async fn new(path: &Path, since: DateTime<Utc>) -> Self {
+        let (reader, open_error) = match AsyncFactStreamReader::open(path).await {
+            Ok(reader) => (Some(reader), None),
+            Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(e) => (None, Some(e)),
+        };
         Self {
             reader,
-            since,
-            line_buffer: String::with_capacity(1024),
-            found_starting_point: false,
-            _phantom: std::marker::PhantomData,
+            open_error,
+            filter: SinceFilter::new(since),
         }
     }
 
-    /// Read the next fact from the iterator.
-    pub async fn next(&mut self) -> Option<Fact<E, V, S>> {
+    /// Read the next fact, or `None` if no complete line is available yet
+    /// (or iteration has ended after an I/O error).
+    pub async fn next(&mut self) -> Option<Result<Fact<E, V, S>, ReadError>>
+    where
+        E: DeserializeOwned,
+        V: DeserializeOwned,
+        S: DeserializeOwned,
+    {
+        if let Some(e) = self.open_error.take() {
+            return Some(Err(e));
+        }
         loop {
-            self.line_buffer.clear();
-
-            // Read next line
-            let bytes_read = self.reader.read_line(&mut self.line_buffer).await.ok()?;
-            if bytes_read == 0 {
-                return None; // EOF
-            }
-
-            // Parse fact
-            let fact: Fact<E, V, S> = serde_json::from_str(&self.line_buffer).ok()?;
-
-            // If we haven't found starting point yet, check timestamp
-            if !self.found_starting_point {
-                if fact.timestamp() >= &self.since {
-                    self.found_starting_point = true;
-                    return Some(fact);
+            match self.reader.as_mut()?.next().await? {
+                Ok(fact) if self.filter.admits(&fact) => return Some(Ok(fact)),
+                Ok(_) => continue,
+                Err(e @ ReadError::Io(_)) => {
+                    self.reader = None;
+                    return Some(Err(e));
                 }
-                // Skip this fact, continue searching
-                continue;
+                Err(e) => return Some(Err(e)),
             }
-
-            // We're past starting point, return all facts
-            return Some(fact);
         }
     }
 }
@@ -268,7 +379,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{assert_fact_value_format, Fact, Operation};
+    use crate::{assert_fact_value_format, Fact, Operation, WriteError};
     use serde::{Deserialize, Serialize};
     use tempfile::NamedTempFile;
 
@@ -316,7 +427,7 @@ mod tests {
         let store: AsyncFactStore<String, TestValue, String> =
             AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
-        assert_eq!(store.latest_timestamp(), None);
+        assert_eq!(store.latest_timestamp().await, None);
     }
 
     #[tokio::test]
@@ -328,10 +439,10 @@ mod tests {
         let facts = create_test_facts();
 
         store.append(facts[0].clone()).await.unwrap();
-        assert_eq!(store.latest_timestamp(), Some(*facts[0].timestamp()));
+        assert_eq!(store.latest_timestamp().await, Some(*facts[0].timestamp()));
 
         store.append(facts[1].clone()).await.unwrap();
-        assert_eq!(store.latest_timestamp(), Some(*facts[1].timestamp()));
+        assert_eq!(store.latest_timestamp().await, Some(*facts[1].timestamp()));
     }
 
     #[tokio::test]
@@ -359,11 +470,7 @@ mod tests {
         let facts = create_test_facts();
         store.append_batch(&facts).await.unwrap();
 
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter().await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter().await).await;
 
         assert_eq!(read_facts.len(), 3);
         assert_eq!(read_facts, facts);
@@ -380,11 +487,7 @@ mod tests {
 
         // Start from second fact's timestamp
         let since = *facts[1].timestamp();
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter_from(since).await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter_from(since).await).await;
 
         assert_eq!(read_facts.len(), 2);
         assert_eq!(read_facts[0], facts[1]);
@@ -402,11 +505,7 @@ mod tests {
 
         // Start from timestamp after all facts
         let since = "2024-01-15T11:00:00Z".parse().unwrap();
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter_from(since).await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter_from(since).await).await;
 
         assert_eq!(read_facts.len(), 0);
     }
@@ -422,11 +521,7 @@ mod tests {
 
         // Start from timestamp before all facts
         let since = "2024-01-15T09:00:00Z".parse().unwrap();
-        let mut read_facts = Vec::new();
-        let mut iter = store.iter_from(since).await;
-        while let Some(fact) = iter.next().await {
-            read_facts.push(fact);
-        }
+        let read_facts = collect_ok(store.iter_from(since).await).await;
 
         assert_eq!(read_facts.len(), 3);
         assert_eq!(read_facts, facts);
@@ -450,7 +545,7 @@ mod tests {
                 AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
             // Latest timestamp should be restored
-            assert_eq!(store.latest_timestamp(), Some(*facts[0].timestamp()));
+            assert_eq!(store.latest_timestamp().await, Some(*facts[0].timestamp()));
 
             // Should be able to append next fact
             store.append(facts[1].clone()).await.unwrap();
@@ -460,13 +555,314 @@ mod tests {
         {
             let store: AsyncFactStore<String, TestValue, String> =
                 AsyncFactStore::open_or_create(temp.path()).await.unwrap();
-            let mut read_facts = Vec::new();
-            let mut iter = store.iter().await;
-            while let Some(fact) = iter.next().await {
-                read_facts.push(fact);
-            }
+            let read_facts = collect_ok(store.iter().await).await;
             assert_eq!(read_facts.len(), 2);
         }
+    }
+
+    async fn collect_reader(
+        mut reader: crate::io::AsyncFactStreamReader<String, TestValue, String>,
+    ) -> Vec<Fact<String, TestValue, String>> {
+        let mut facts = Vec::new();
+        while let Some(result) = reader.next().await {
+            facts.push(result.unwrap());
+        }
+        facts
+    }
+
+    #[tokio::test]
+    async fn test_append_returns_positions_and_read_at_resumes() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let facts = create_test_facts();
+
+        let after_first = store.append(facts[0].clone()).await.unwrap();
+        let after_rest = store.append_batch(&facts[1..]).await.unwrap();
+        assert!(after_first < after_rest);
+        assert_eq!(
+            after_rest,
+            StreamPosition::from_offset(std::fs::metadata(temp.path()).unwrap().len())
+        );
+
+        let resumed = collect_reader(store.read_at(after_first).await.unwrap()).await;
+        assert_eq!(resumed, facts[1..]);
+
+        let all = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+        assert_eq!(all, facts);
+
+        let mut at_end = store.read_at(after_rest).await.unwrap();
+        assert!(at_end.next().await.is_none());
+        assert_eq!(at_end.position(), after_rest);
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_batch_returns_current_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(dir.path().join("facts.stream"))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            store.append_batch(&[]).await.unwrap(),
+            StreamPosition::START
+        );
+        let after = store.append_batch(&create_test_facts()).await.unwrap();
+        assert_eq!(store.append_batch(&[]).await.unwrap(), after);
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_batch_on_torn_tail_returns_a_readable_position() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        store.append(a.clone()).await.unwrap();
+        {
+            // A crashed writer left half a line behind.
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap();
+            file.write_all(br#"{"e":"torn"#).unwrap();
+        }
+
+        let end = store.append_batch(&[]).await.unwrap();
+        assert_eq!(
+            end,
+            StreamPosition::from_offset(std::fs::metadata(temp.path()).unwrap().len())
+        );
+        assert!(store.read_at(end).await.unwrap().next().await.is_none());
+
+        let b = count_fact(2, at("10:01:00"));
+        store.append(b.clone()).await.unwrap();
+        assert_eq!(
+            collect_reader(store.read_at(end).await.unwrap()).await,
+            vec![b]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_batch_on_missing_file_does_not_create_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.stream");
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(&path).await.unwrap();
+
+        assert_eq!(
+            store.append_batch(&[]).await.unwrap(),
+            StreamPosition::START
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_read_at_on_store_without_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(dir.path().join("facts.stream"))
+                .await
+                .unwrap();
+
+        let facts = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+        assert!(facts.is_empty());
+        assert!(dir.path().join("facts.stream").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_at_open_failure_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::File::open(temp.path()).is_ok() {
+            // Running with privileges that bypass permissions.
+            return;
+        }
+
+        let result = store.read_at(StreamPosition::START).await;
+        assert!(
+            matches!(&result, Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "expected StoreError::Io(PermissionDenied), got {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_out_of_order_batch_is_rejected_and_nothing_is_written() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        store.append(count_fact(0, at("09:00:00"))).await.unwrap();
+        let len_before = std::fs::metadata(temp.path()).unwrap().len();
+
+        let result = store
+            .append_batch(&[count_fact(1, at("10:05:00")), count_fact(2, at("10:00:00"))])
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::TimestampOrdering { new, latest })
+                if new == at("10:00:00") && latest == at("10:05:00")),
+            "got {result:?}"
+        );
+        assert_eq!(std::fs::metadata(temp.path()).unwrap().len(), len_before);
+        assert_eq!(store.latest_timestamp().await, Some(at("09:00:00")));
+    }
+
+    #[tokio::test]
+    async fn test_batch_with_equal_timestamps_is_accepted() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        store.append(count_fact(0, at("09:00:00"))).await.unwrap();
+
+        let batch = [count_fact(1, at("10:00:00")), count_fact(2, at("10:00:00"))];
+        store.append_batch(&batch).await.unwrap();
+        assert_eq!(store.latest_timestamp().await, Some(at("10:00:00")));
+    }
+
+    #[tokio::test]
+    async fn test_lock_timeout_rolls_the_cache_back() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path())
+                .await
+                .unwrap()
+                .with_lock_timeout(std::time::Duration::from_millis(100));
+        store.append(count_fact(0, at("10:00:00"))).await.unwrap();
+
+        use fs2::FileExt;
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let result = store.append(count_fact(1, at("10:05:00"))).await;
+        assert!(
+            matches!(result, Err(StoreError::Write(WriteError::LockTimeout(_)))),
+            "expected LockTimeout, got {result:?}"
+        );
+        FileExt::unlock(&holder).unwrap();
+
+        assert_eq!(store.latest_timestamp().await, Some(at("10:00:00")));
+        store.append(count_fact(2, at("10:02:00"))).await.unwrap();
+        assert_eq!(store.latest_timestamp().await, Some(at("10:02:00")));
+    }
+
+    #[tokio::test]
+    async fn test_dropped_append_batch_still_advances_the_cache() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let first = count_fact(0, at("10:00:00"));
+        store.append(first.clone()).await.unwrap();
+
+        // Hold the file lock so the write is still waiting for it when the
+        // future is dropped.
+        use fs2::FileExt;
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let dropped = [count_fact(1, at("10:05:00"))];
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            store.append_batch(&dropped),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "expected the append to still be waiting"
+        );
+        FileExt::unlock(&holder).unwrap();
+
+        // The started write is not abandoned: wait (bounded) for it to land.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let written = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+            if written.len() == 2 {
+                assert_eq!(written, vec![first.clone(), dropped[0].clone()]);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped append never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The cache was advanced before the write, so an append earlier than
+        // the dropped batch is rejected rather than written out of order.
+        let result = store.append(count_fact(2, at("10:02:00"))).await;
+        assert!(
+            matches!(result, Err(StoreError::TimestampOrdering { new, latest })
+                if new == at("10:02:00") && latest == at("10:05:00")),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reopen_skips_non_utf8_lines_and_ignores_an_unterminated_tail() {
+        let temp = NamedTempFile::new().unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let tail = count_fact(3, at("10:09:00"));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap();
+            writeln!(file, "{}", a.to_line().unwrap()).unwrap();
+            file.write_all(b"\xff\n").unwrap();
+            writeln!(file, "{}", b.to_line().unwrap()).unwrap();
+            write!(file, "{}", tail.to_line().unwrap()).unwrap();
+        }
+
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        assert_eq!(store.latest_timestamp().await, Some(*b.timestamp()));
+    }
+
+    #[tokio::test]
+    async fn test_reopen_takes_the_max_timestamp() {
+        let temp = NamedTempFile::new().unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap();
+            for fact in [
+                count_fact(1, at("10:00:00")),
+                count_fact(2, at("10:05:00")),
+                count_fact(3, at("10:01:00")),
+            ] {
+                writeln!(file, "{}", fact.to_line().unwrap()).unwrap();
+            }
+        }
+
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        assert_eq!(store.latest_timestamp().await, Some(at("10:05:00")));
+    }
+
+    #[tokio::test]
+    async fn test_read_at_invalid_position_is_a_read_error() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        store.append_batch(&create_test_facts()).await.unwrap();
+
+        let result = store.read_at(StreamPosition::from_offset(1)).await;
+        assert!(matches!(
+            result,
+            Err(StoreError::Read(ReadError::InvalidPosition(_)))
+        ));
     }
 
     #[tokio::test]
@@ -475,11 +871,302 @@ mod tests {
         let store: AsyncFactStore<String, TestValue, String> =
             AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
-        let mut facts = Vec::new();
-        let mut iter = store.iter().await;
-        while let Some(fact) = iter.next().await {
-            facts.push(fact);
-        }
+        let facts = collect_ok(store.iter().await).await;
         assert_eq!(facts.len(), 0);
+    }
+
+    fn count_fact(n: u32, timestamp: DateTime<Utc>) -> Fact<String, TestValue, String> {
+        Fact::new(
+            format!("item{n}"),
+            TestValue::Count(n),
+            timestamp,
+            "source1".to_string(),
+            Operation::Assert,
+        )
+    }
+
+    type TestFact = Fact<String, TestValue, String>;
+
+    async fn collect_ok(mut iter: AsyncFactIterator<String, TestValue, String>) -> Vec<TestFact> {
+        let mut facts = Vec::new();
+        while let Some(item) = iter.next().await {
+            facts.push(item.unwrap());
+        }
+        facts
+    }
+
+    /// Each item as `Some(fact)`, or `None` for a line that failed to
+    /// decode. Any other error fails the test.
+    async fn outcomes(
+        mut iter: AsyncFactIterator<String, TestValue, String>,
+    ) -> Vec<Option<TestFact>> {
+        let mut items = Vec::new();
+        while let Some(item) = iter.next().await {
+            items.push(match item {
+                Ok(fact) => Some(fact),
+                Err(ReadError::Deserialization(_)) => None,
+                Err(e) => panic!("expected a decode error, got {e:?}"),
+            });
+        }
+        items
+    }
+
+    fn append_garbage_line(path: &Path) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(b"this is not a fact\n").unwrap();
+    }
+
+    fn at(time: &str) -> DateTime<Utc> {
+        format!("2024-01-15T{time}Z").parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_iter_yields_err_for_malformed_line_and_continues() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let c = count_fact(3, at("10:02:00"));
+
+        store.append(a.clone()).await.unwrap();
+        append_garbage_line(temp.path());
+        store.append_batch(&[b.clone(), c.clone()]).await.unwrap();
+
+        assert_eq!(
+            outcomes(store.iter().await).await,
+            vec![Some(a), None, Some(b), Some(c)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iter_from_yields_err_for_malformed_line_and_continues() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let early = count_fact(0, at("09:00:00"));
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let c = count_fact(3, at("10:02:00"));
+
+        store.append_batch(&[early, a.clone()]).await.unwrap();
+        append_garbage_line(temp.path());
+        store.append_batch(&[b.clone(), c.clone()]).await.unwrap();
+
+        assert_eq!(
+            outcomes(store.iter_from(*a.timestamp()).await).await,
+            vec![Some(a), None, Some(b.clone()), Some(c.clone())]
+        );
+        assert_eq!(
+            outcomes(store.iter_from(*b.timestamp()).await).await,
+            vec![None, Some(b), Some(c)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iter_on_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(dir.path().join("facts.stream"))
+                .await
+                .unwrap();
+
+        let mut iter = store.iter().await;
+        assert!(iter.next().await.is_none());
+        assert!(iter.next().await.is_none());
+        assert!(store.iter_from(at("10:00:00")).await.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_iter_is_not_fused_at_end_of_stream() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        store.append(a.clone()).await.unwrap();
+
+        let mut iter = store.iter().await;
+        assert_eq!(iter.next().await.unwrap().unwrap(), a);
+        assert!(iter.next().await.is_none());
+
+        store.append(b.clone()).await.unwrap();
+        assert_eq!(iter.next().await.unwrap().unwrap(), b);
+        assert!(iter.next().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_iter_stops_after_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.stream");
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(&path).await.unwrap();
+        // A directory opens fine on Unix, but reading it fails.
+        std::fs::create_dir(&path).unwrap();
+
+        let mut iter = store.iter().await;
+        assert!(matches!(iter.next().await, Some(Err(ReadError::Io(_)))));
+        assert!(iter.next().await.is_none());
+        assert!(iter.next().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_iter_yields_open_error_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("sub");
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(parent.join("facts.stream"))
+                .await
+                .unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+        std::fs::write(&parent, b"").unwrap();
+
+        let mut iter = store.iter_from(at("10:00:00")).await;
+        assert!(matches!(iter.next().await, Some(Err(ReadError::Io(_)))));
+        assert!(iter.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_latest_timestamp_skips_malformed_lines() {
+        let temp = NamedTempFile::new().unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        {
+            let store: AsyncFactStore<String, TestValue, String> =
+                AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+            store.append(a.clone()).await.unwrap();
+        }
+        append_garbage_line(temp.path());
+
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        assert_eq!(store.latest_timestamp().await, Some(*a.timestamp()));
+    }
+
+    #[tokio::test]
+    async fn test_store_error_is_the_crate_root_store_error() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        store.append(count_fact(2, at("10:01:00"))).await.unwrap();
+
+        // Compiles only if the async store's error is `crate::StoreError`.
+        let result: Result<StreamPosition, crate::StoreError> =
+            store.append(count_fact(1, at("10:00:00"))).await;
+        assert!(matches!(
+            result,
+            Err(crate::StoreError::TimestampOrdering { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_append_succeeds_while_a_reader_is_mid_iteration() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let facts = create_test_facts();
+        store.append_batch(&facts).await.unwrap();
+
+        let mut reader = store.read_at(StreamPosition::START).await.unwrap();
+        assert_eq!(reader.next().await.unwrap().unwrap(), facts[0]);
+        let mid = reader.position();
+
+        // The reader holds no lock, so the writer is not blocked.
+        let later = count_fact(4, "2024-01-15T10:03:00Z".parse().unwrap());
+        let end = store.append(later.clone()).await.unwrap();
+
+        // The same reader tails the stream and sees the new fact.
+        let mut rest = Vec::new();
+        while let Some(result) = reader.next().await {
+            rest.push(result.unwrap());
+        }
+        assert_eq!(rest, vec![facts[1].clone(), facts[2].clone(), later]);
+        assert_eq!(reader.position(), end);
+
+        // A reader reopened at the earlier position sees it too.
+        assert_eq!(
+            collect_reader(store.read_at(mid).await.unwrap()).await,
+            rest
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_lock_timeout_is_applied() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        assert_eq!(store.lock_timeout(), crate::store::DEFAULT_LOCK_TIMEOUT);
+
+        let store = store.with_lock_timeout(std::time::Duration::ZERO);
+        assert_eq!(store.lock_timeout(), std::time::Duration::ZERO);
+
+        use fs2::FileExt;
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let result = store.append(create_test_facts()[0].clone()).await;
+        assert!(
+            matches!(result, Err(StoreError::Write(WriteError::AlreadyLocked))),
+            "expected AlreadyLocked, got {result:?}"
+        );
+        FileExt::unlock(&holder).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_appends_all_land_in_timestamp_order() {
+        const TASKS: u32 = 8;
+        const PER_TASK: u32 = 25;
+
+        let temp = NamedTempFile::new().unwrap();
+        let store: std::sync::Arc<AsyncFactStore<String, TestValue, String>> =
+            std::sync::Arc::new(AsyncFactStore::open_or_create(temp.path()).await.unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..PER_TASK {
+                    let n = t * PER_TASK + i;
+                    // See the sync test: a timestamp taken before the append
+                    // can lose the race and be rightly rejected; retry with a
+                    // fresh one. Any other error fails the test.
+                    loop {
+                        match store.append(count_fact(n, Utc::now())).await {
+                            Ok(_) => break,
+                            Err(StoreError::TimestampOrdering { .. }) => continue,
+                            Err(e) => panic!("append {n} failed: {e}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let written = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+        assert_eq!(written.len(), (TASKS * PER_TASK) as usize);
+        assert!(
+            written
+                .windows(2)
+                .all(|w| w[0].timestamp() <= w[1].timestamp()),
+            "facts are not in non-decreasing timestamp order"
+        );
+        let mut values: Vec<u32> = written
+            .iter()
+            .map(|f| match f.value() {
+                TestValue::Count(n) => *n,
+            })
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, (0..TASKS * PER_TASK).collect::<Vec<_>>());
+        assert_eq!(
+            store.latest_timestamp().await,
+            Some(*written.last().unwrap().timestamp())
+        );
     }
 }

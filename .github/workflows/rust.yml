@@ -78,4 +78,8 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
     - name: Check documentation
-      run: cargo doc --all-features --no-deps
+      env:
+        RUSTDOCFLAGS: -D warnings
+      run: |
+        cargo doc --no-deps
+        cargo doc --all-features --no-deps

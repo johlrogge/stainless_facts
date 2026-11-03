@@ -8,3 +8,6 @@
 /.claude/skills/
 /.claude/agents/
 /.claude/commands/
+
+# Files written by running the examples
+/*.facts

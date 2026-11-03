@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read them back
     println!("All facts:");
     for fact in store.iter() {
+        let fact = fact?;
         println!("  {:?}", fact);
     }
 
