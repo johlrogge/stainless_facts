@@ -37,7 +37,8 @@ pub use async_store::{AsyncFactIterator, AsyncFactStore};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 /// Represents whether a fact is asserting or retracting information.
@@ -139,20 +140,110 @@ pub trait FactAggregator<E, V, S> {
 }
 
 /// Aggregate an iterator of facts into a map of aggregated entities.
+///
+/// Equivalent to [`aggregate_facts_into`] on an empty map, so a whole fold
+/// and a fold resumed at any split point produce the same map.
+///
+/// A Retract against an entity with no aggregate is a no-op: an entity whose
+/// facts in `facts` are only retracts gets no entry (before 0.3.0 it got a
+/// `Default` entry).
 pub fn aggregate_facts<E, V, S, A, I>(facts: I) -> HashMap<E, A>
 where
     E: Eq + Hash + Clone,
     A: FactAggregator<E, V, S> + Default,
     I: IntoIterator<Item = Fact<E, V, S>>,
 {
-    let mut aggregators = HashMap::new();
+    let mut aggregates = HashMap::new();
+    aggregate_facts_into(&mut aggregates, facts);
+    aggregates
+}
+
+/// Fold `facts` (in log order) into existing `aggregates`. Returns the
+/// entities touched.
+///
+/// This resumes a fold: for any split of a fact sequence into a prefix and a
+/// suffix, folding the suffix into `aggregate_facts(prefix)` gives the same
+/// map as `aggregate_facts` over the whole sequence. New entities start from
+/// `A::default()`.
+///
+/// A Retract against an entity with no aggregate is a no-op: no entry is
+/// created and the entity is not touched.
+///
+/// # Touched set
+///
+/// The returned set contains exactly the keys whose map state this call
+/// changed: inserted, mutated (a fact was dispatched to the aggregate), or
+/// removed. A touched key that is absent from the map afterwards has been
+/// retired. A Retract against an absent key is excluded, because nothing
+/// changed. Keys not in the set were left exactly as they were, so a caller
+/// only needs to revisit (for example with [`retain_touched`]) the touched
+/// keys.
+pub fn aggregate_facts_into<E, V, S, A, I>(aggregates: &mut HashMap<E, A>, facts: I) -> HashSet<E>
+where
+    E: Eq + Hash + Clone,
+    A: FactAggregator<E, V, S> + Default,
+    I: IntoIterator<Item = Fact<E, V, S>>,
+{
+    fold_into_with(aggregates, facts, |_| A::default())
+}
+
+/// The single fold behind every public aggregation entry point.
+///
+/// Per fact, in order: dispatch to the existing aggregate if there is one;
+/// otherwise skip a Retract (no insert, no `init`, not touched) or insert
+/// `init(&key)` for an Assert and dispatch to it. Every dispatched key is
+/// recorded in the returned touched set.
+fn fold_into_with<E, V, S, A, I>(
+    aggregates: &mut HashMap<E, A>,
+    facts: I,
+    mut init: impl FnMut(&E) -> A,
+) -> HashSet<E>
+where
+    E: Eq + Hash + Clone,
+    A: FactAggregator<E, V, S>,
+    I: IntoIterator<Item = Fact<E, V, S>>,
+{
+    let mut touched = HashSet::new();
 
     for fact in facts {
-        let aggregator: &mut A = aggregators.entry(fact.entity().clone()).or_default();
-        aggregator.apply(&fact);
+        let aggregate = match aggregates.entry(fact.entity().clone()) {
+            Entry::Occupied(slot) => slot.into_mut(),
+            Entry::Vacant(_) if fact.operation() == Operation::Retract => continue,
+            Entry::Vacant(slot) => {
+                let fresh = init(slot.key());
+                slot.insert(fresh)
+            }
+        };
+        aggregate.apply(&fact);
+
+        if !touched.contains(fact.entity()) {
+            touched.insert(fact.entity().clone());
+        }
     }
 
-    aggregators
+    touched
+}
+
+/// Drop touched aggregates failing `keep`; the sweep cost scales with the
+/// delta, not with the size of the map.
+///
+/// `keep` is called once for each key in `touched` that is present in
+/// `aggregates`, with the key and its aggregate; entries for which it returns
+/// `false` are removed. Entries whose key is not in `touched` are never
+/// visited or removed. Touched keys that are absent from the map (retired
+/// entities, see [`aggregate_facts_into`]) are skipped.
+pub fn retain_touched<E: Eq + Hash, A>(
+    aggregates: &mut HashMap<E, A>,
+    touched: &HashSet<E>,
+    mut keep: impl FnMut(&E, &A) -> bool,
+) {
+    for key in touched {
+        if let Some(aggregate) = aggregates.get(key) {
+            if !keep(key, aggregate) {
+                aggregates.remove(key);
+            }
+        }
+    }
 }
 
 /// Trait for building validated output from an aggregator.
@@ -209,7 +300,7 @@ mod tests {
         Title(String),
     }
 
-    #[derive(Default)]
+    #[derive(Debug, Clone, Default, PartialEq)]
     struct Titles(Vec<String>);
 
     impl FactAggregator<String, TestValue, String> for Titles {
@@ -365,5 +456,175 @@ mod tests {
     #[test]
     fn value_format_is_tagged() {
         assert_fact_value_format!(TestValue::Title("x".to_string()));
+    }
+
+    fn titles(items: &[&str]) -> Titles {
+        Titles(items.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn keys(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn aggregate_facts_omits_retract_only_entities() {
+        let facts = vec![
+            fact("a", "one", Operation::Assert),
+            fact("ghost", "one", Operation::Retract),
+        ];
+
+        let aggregates: HashMap<String, Titles> = aggregate_facts(facts);
+
+        assert!(aggregates.contains_key("a"));
+        assert!(!aggregates.contains_key("ghost"));
+        assert_eq!(aggregates.len(), 1);
+    }
+
+    #[test]
+    fn retract_against_absent_entity_creates_no_key() {
+        let mut aggregates: HashMap<String, Titles> = HashMap::new();
+        aggregates.insert("b".to_string(), titles(&["x"]));
+
+        let touched =
+            aggregate_facts_into(&mut aggregates, vec![fact("a", "one", Operation::Retract)]);
+
+        assert!(!aggregates.contains_key("a"));
+        assert_eq!(aggregates.len(), 1);
+        assert!(touched.is_empty());
+    }
+
+    #[test]
+    fn empty_delta_returns_empty_touched_set_and_leaves_map_unchanged() {
+        let mut aggregates: HashMap<String, Titles> = HashMap::new();
+        aggregates.insert("a".to_string(), titles(&["one"]));
+        aggregates.insert("b".to_string(), titles(&[]));
+        let before = aggregates.clone();
+
+        let touched = aggregate_facts_into(&mut aggregates, Vec::new());
+
+        assert!(touched.is_empty());
+        assert_eq!(aggregates, before);
+    }
+
+    #[test]
+    fn touched_set_is_delta_entities_minus_absent_retract_only_entities() {
+        let mut aggregates: HashMap<String, Titles> = HashMap::new();
+        aggregates.insert("present".to_string(), titles(&["one"]));
+        aggregates.insert("untouched".to_string(), titles(&["one"]));
+
+        let delta = vec![
+            // present entity, retract only: touched
+            fact("present", "one", Operation::Retract),
+            // absent entity, retract only: not touched
+            fact("ghost", "one", Operation::Retract),
+            // absent entity, assert: touched
+            fact("new", "one", Operation::Assert),
+            // absent entity, retract then assert: touched (by the assert)
+            fact("late", "one", Operation::Retract),
+            fact("late", "two", Operation::Assert),
+        ];
+
+        let touched = aggregate_facts_into(&mut aggregates, delta);
+
+        assert_eq!(touched, keys(&["present", "new", "late"]));
+        assert_eq!(aggregates["present"], titles(&[]));
+        assert_eq!(aggregates["new"], titles(&["one"]));
+        assert_eq!(aggregates["late"], titles(&["two"]));
+        assert_eq!(aggregates["untouched"], titles(&["one"]));
+        assert!(!aggregates.contains_key("ghost"));
+    }
+
+    #[test]
+    fn retain_touched_never_removes_untouched_entries() {
+        let mut aggregates: HashMap<String, Titles> = HashMap::new();
+        aggregates.insert("a".to_string(), titles(&[]));
+        aggregates.insert("b".to_string(), titles(&[]));
+        aggregates.insert("c".to_string(), titles(&["keep"]));
+        // "gone" is touched but absent from the map; must be tolerated.
+        let touched = keys(&["a", "c", "gone"]);
+
+        let mut seen = Vec::new();
+        retain_touched(&mut aggregates, &touched, |key, _| {
+            seen.push(key.clone());
+            false
+        });
+
+        assert_eq!(aggregates.len(), 1);
+        assert!(aggregates.contains_key("b"));
+        seen.sort();
+        assert_eq!(seen, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn retain_touched_keeps_entries_passing_keep() {
+        let mut aggregates: HashMap<String, Titles> = HashMap::new();
+        aggregates.insert("a".to_string(), titles(&[]));
+        aggregates.insert("c".to_string(), titles(&["keep"]));
+        let touched = keys(&["a", "c"]);
+
+        retain_touched(&mut aggregates, &touched, |_, agg| !agg.0.is_empty());
+
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates["c"], titles(&["keep"]));
+    }
+
+    mod split_fold {
+        use super::*;
+        use proptest::prelude::*;
+
+        const ENTITIES: [&str; 3] = ["a", "b", "c"];
+        const TITLES: [&str; 2] = ["x", "y"];
+
+        fn facts_strategy() -> impl Strategy<Value = Vec<Fact<String, TestValue, String>>> {
+            prop::collection::vec((0..ENTITIES.len(), 0..TITLES.len(), any::<bool>()), 0..24)
+                .prop_map(|raw| {
+                    raw.into_iter()
+                        .map(|(e, t, is_assert)| {
+                            let op = if is_assert {
+                                Operation::Assert
+                            } else {
+                                Operation::Retract
+                            };
+                            fact(ENTITIES[e], TITLES[t], op)
+                        })
+                        .collect()
+                })
+        }
+
+        /// Entities in `delta`, minus those that only see retracts while
+        /// absent from `before`.
+        fn expected_touched(
+            before: &HashMap<String, Titles>,
+            delta: &[Fact<String, TestValue, String>],
+        ) -> HashSet<String> {
+            delta
+                .iter()
+                .filter(|f| before.contains_key(f.entity()) || f.operation() == Operation::Assert)
+                .map(|f| f.entity().clone())
+                .collect()
+        }
+
+        proptest! {
+            #[test]
+            fn split_fold_equals_whole_fold_at_every_split_point(facts in facts_strategy()) {
+                let whole: HashMap<String, Titles> = aggregate_facts(facts.clone());
+
+                for k in 0..=facts.len() {
+                    let (prefix, suffix) = facts.split_at(k);
+                    let mut resumed: HashMap<String, Titles> = aggregate_facts(prefix.to_vec());
+                    let before = resumed.clone();
+
+                    let touched = aggregate_facts_into(&mut resumed, suffix.to_vec());
+
+                    prop_assert_eq!(&resumed, &whole, "split point k = {}", k);
+                    prop_assert_eq!(touched, expected_touched(&before, suffix), "split point k = {}", k);
+                    for (key, agg) in &resumed {
+                        if !expected_touched(&before, suffix).contains(key) {
+                            prop_assert_eq!(Some(agg), before.get(key));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
