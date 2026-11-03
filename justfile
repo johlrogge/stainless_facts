@@ -145,3 +145,10 @@ doc:
 [group('docs')]
 doc-check:
     cargo doc --all-features --no-deps
+
+# === Cleanup ===
+
+# clean build artifacts
+[group('build')]
+clean:
+    cargo clean
