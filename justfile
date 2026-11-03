@@ -51,12 +51,12 @@ clippy-all: clippy-default clippy-tokio
 [group('build')]
 clippy-default:
     @echo "=== Clippy: Default (sync I/O) ==="
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 [group('build')]
 clippy-tokio:
     @echo "=== Clippy: tokio (sync + async I/O) ==="
-    cargo clippy --features tokio -- -D warnings
+    cargo clippy --all-targets --features tokio -- -D warnings
 
 # === Build Commands ===
 

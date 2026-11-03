@@ -53,7 +53,7 @@ jobs:
       with:
         components: clippy
     - name: Clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --all-targets -- -D warnings
 
   # Clippy with tokio
   clippy-tokio:
@@ -64,7 +64,7 @@ jobs:
       with:
         components: clippy
     - name: Clippy
-      run: cargo clippy --features tokio -- -D warnings
+      run: cargo clippy --all-targets --features tokio -- -D warnings
 
   # Format check
   fmt:

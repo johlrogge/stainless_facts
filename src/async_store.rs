@@ -328,10 +328,10 @@ mod tests {
         let facts = create_test_facts();
 
         store.append(facts[0].clone()).await.unwrap();
-        assert_eq!(store.latest_timestamp(), Some(facts[0].timestamp().clone()));
+        assert_eq!(store.latest_timestamp(), Some(*facts[0].timestamp()));
 
         store.append(facts[1].clone()).await.unwrap();
-        assert_eq!(store.latest_timestamp(), Some(facts[1].timestamp().clone()));
+        assert_eq!(store.latest_timestamp(), Some(*facts[1].timestamp()));
     }
 
     #[tokio::test]
@@ -379,7 +379,7 @@ mod tests {
         store.append_batch(&facts).await.unwrap();
 
         // Start from second fact's timestamp
-        let since = facts[1].timestamp().clone();
+        let since = *facts[1].timestamp();
         let mut read_facts = Vec::new();
         let mut iter = store.iter_from(since).await;
         while let Some(fact) = iter.next().await {
@@ -450,7 +450,7 @@ mod tests {
                 AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
             // Latest timestamp should be restored
-            assert_eq!(store.latest_timestamp(), Some(facts[0].timestamp().clone()));
+            assert_eq!(store.latest_timestamp(), Some(*facts[0].timestamp()));
 
             // Should be able to append next fact
             store.append(facts[1].clone()).await.unwrap();
