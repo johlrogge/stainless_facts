@@ -10,7 +10,7 @@ documentation = "https://docs.rs/stainless-facts"
 readme = "README.md"
 keywords = ["facts", "event-sourcing", "datomic", "immutable", "schema-evolution"]
 categories = ["data-structures", "database"]
-rust-version = "1.70"
+rust-version = "1.85"
 
 [features]
 default = []
@@ -35,6 +35,8 @@ tokio = { version = "1", features = ["fs", "io-util", "time", "rt-multi-thread",
 rstest = "0.26"
 tempfile = "3.8"
 tokio = { version = "1", features = ["macros", "rt"] }
+# Capped below 1.12 to keep the MSRV at 1.85 (proptest 1.12 requires Rust 1.88)
+proptest = ">=1.5, <1.12"
 
 [package.metadata.docs.rs]
 all-features = true
