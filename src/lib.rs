@@ -108,6 +108,29 @@ pub trait FactAggregator<E, V, S> {
     /// Handle a retraction fact.
     fn retract(&mut self, value: &V, source: &S);
 
+    /// Apply a single fact to this aggregator.
+    ///
+    /// This is the single entry point the fold functions (such as
+    /// [`aggregate_facts`]) call for every fact, and the only hook that sees
+    /// the whole [`Fact`]: entity, value, timestamp, source and operation.
+    /// The default implementation dispatches on [`Fact::operation`] to
+    /// [`assert`](Self::assert) or [`retract`](Self::retract).
+    ///
+    /// Override it when the aggregate needs the timestamp (e.g. last-write-wins),
+    /// the entity, or wants to handle both operations in one place.
+    ///
+    /// Overriding `apply` does not make `assert` and `retract` optional; they
+    /// remain required methods. This is deliberate: if they had default no-op
+    /// bodies, an implementation that forgot to override anything would
+    /// compile silently and drop every fact. An `apply` override that does not
+    /// use them may implement them as `unreachable!()` or delegate to them.
+    fn apply(&mut self, fact: &Fact<E, V, S>) {
+        match fact.operation() {
+            Operation::Assert => self.assert(fact.value(), fact.source()),
+            Operation::Retract => self.retract(fact.value(), fact.source()),
+        }
+    }
+
     /// Handle an unknown assertion.
     fn assert_unknown(&mut self, _attribute: &str, _value: &JsonValue, _source: &S) {}
 
@@ -126,11 +149,7 @@ where
 
     for fact in facts {
         let aggregator: &mut A = aggregators.entry(fact.entity().clone()).or_default();
-
-        match fact.operation() {
-            Operation::Assert => aggregator.assert(fact.value(), fact.source()),
-            Operation::Retract => aggregator.retract(fact.value(), fact.source()),
-        }
+        aggregator.apply(&fact);
     }
 
     aggregators
@@ -228,6 +247,119 @@ mod tests {
 
         assert_eq!(aggregates["a"].0, vec!["three".to_string()]);
         assert_eq!(aggregates["b"].0, vec!["two".to_string()]);
+    }
+
+    fn fact_at(
+        entity: &str,
+        title: &str,
+        secs: i64,
+        operation: Operation,
+    ) -> Fact<String, TestValue, String> {
+        Fact::new(
+            entity.to_string(),
+            TestValue::Title(title.to_string()),
+            DateTime::from_timestamp(secs, 0).expect("valid timestamp"),
+            "test".to_string(),
+            operation,
+        )
+    }
+
+    /// Records everything `apply` sees; assert/retract must never be reached.
+    #[derive(Default)]
+    struct Recorder(Vec<(String, DateTime<Utc>, Operation)>);
+
+    impl FactAggregator<String, TestValue, String> for Recorder {
+        fn assert(&mut self, _value: &TestValue, _source: &String) {
+            panic!("apply override should bypass assert");
+        }
+
+        fn retract(&mut self, _value: &TestValue, _source: &String) {
+            panic!("apply override should bypass retract");
+        }
+
+        fn apply(&mut self, fact: &Fact<String, TestValue, String>) {
+            self.0
+                .push((fact.entity().clone(), *fact.timestamp(), fact.operation()));
+        }
+    }
+
+    #[test]
+    fn default_apply_matches_assert_retract_dispatch_on_mixed_stream() {
+        let facts = vec![
+            fact("a", "one", Operation::Assert),
+            fact("a", "two", Operation::Assert),
+            fact("b", "x", Operation::Assert),
+            fact("a", "one", Operation::Retract),
+            fact("b", "y", Operation::Assert),
+            fact("b", "x", Operation::Retract),
+        ];
+
+        let mut expected: HashMap<String, Titles> = HashMap::new();
+        for f in facts.clone() {
+            let agg = expected.entry(f.entity().clone()).or_default();
+            match f.operation() {
+                Operation::Assert => agg.assert(f.value(), f.source()),
+                Operation::Retract => agg.retract(f.value(), f.source()),
+            }
+        }
+
+        let actual: HashMap<String, Titles> = aggregate_facts(facts);
+
+        assert_eq!(actual.len(), expected.len());
+        for (k, v) in &expected {
+            assert_eq!(actual[k].0, v.0);
+        }
+        assert_eq!(actual["a"].0, vec!["two".to_string()]);
+        assert_eq!(actual["b"].0, vec!["y".to_string()]);
+    }
+
+    #[test]
+    fn overriding_apply_sees_timestamps_in_order() {
+        let facts = vec![
+            fact_at("a", "one", 10, Operation::Assert),
+            fact_at("a", "two", 20, Operation::Assert),
+            fact_at("a", "three", 30, Operation::Assert),
+        ];
+
+        let aggregates: HashMap<String, Recorder> = aggregate_facts(facts);
+
+        let seen: Vec<i64> = aggregates["a"]
+            .0
+            .iter()
+            .map(|(_, t, _)| t.timestamp())
+            .collect();
+        assert_eq!(seen, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn entity_passed_to_apply_matches_map_key() {
+        let facts = vec![
+            fact_at("a", "one", 1, Operation::Assert),
+            fact_at("b", "two", 2, Operation::Assert),
+            fact_at("a", "three", 3, Operation::Assert),
+        ];
+
+        let aggregates: HashMap<String, Recorder> = aggregate_facts(facts);
+
+        for (key, rec) in &aggregates {
+            assert!(!rec.0.is_empty());
+            for (entity, _, _) in &rec.0 {
+                assert_eq!(entity, key);
+            }
+        }
+    }
+
+    #[test]
+    fn retract_reaches_apply_as_retract_operation() {
+        let facts = vec![
+            fact_at("a", "one", 1, Operation::Assert),
+            fact_at("a", "one", 2, Operation::Retract),
+        ];
+
+        let aggregates: HashMap<String, Recorder> = aggregate_facts(facts);
+
+        let ops: Vec<Operation> = aggregates["a"].0.iter().map(|(_, _, op)| *op).collect();
+        assert_eq!(ops, vec![Operation::Assert, Operation::Retract]);
     }
 
     #[test]
