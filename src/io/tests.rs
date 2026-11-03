@@ -472,6 +472,57 @@ fn sync_read_lines_at_pages_through_complete_lines() {
 }
 
 #[test]
+fn sync_read_lines_at_strips_crlf() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let lines: Vec<String> = (1..=2).map(|n| numbered(n).to_line().unwrap()).collect();
+    append_raw(path, format!("{}\r\n{}\n", lines[0], lines[1]).as_bytes());
+
+    let (page, at) = read_lines_at(path, StreamPosition::START, 10).unwrap();
+    assert_eq!(page, lines);
+    assert_eq!(at, file_len(path));
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn async_read_lines_at_strips_crlf() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let lines: Vec<String> = (1..=2).map(|n| numbered(n).to_line().unwrap()).collect();
+    append_raw(path, format!("{}\r\n{}\n", lines[0], lines[1]).as_bytes());
+
+    let (page, at) = read_lines_at_async(path, StreamPosition::START, 10)
+        .await
+        .unwrap();
+    assert_eq!(page, lines);
+    assert_eq!(at, file_len(path));
+}
+
+#[test]
+fn sync_read_lines_at_invalid_utf8_errors_without_advancing() {
+    let temp = NamedTempFile::new().unwrap();
+    let path = temp.path();
+    let good = numbered(1).to_line().unwrap();
+    append_raw(path, format!("{good}\n").as_bytes());
+    append_raw(path, b"\xff\n");
+
+    let (page, at) = read_lines_at(path, StreamPosition::START, 1).unwrap();
+    assert_eq!(page, vec![good]);
+
+    // The bad line fails the call, and the caller's position is unchanged,
+    // so retrying at the same position fails again.
+    for _ in 0..2 {
+        let result = read_lines_at(path, at, 10);
+        assert!(
+            matches!(&result, Err(ReadError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData),
+            "expected InvalidData, got {result:?}"
+        );
+    }
+    // From the start, the whole call fails too.
+    assert!(read_lines_at(path, StreamPosition::START, 10).is_err());
+}
+
+#[test]
 fn sync_read_lines_at_rejects_invalid_position() {
     let temp = NamedTempFile::new().unwrap();
     let path = temp.path();

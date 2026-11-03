@@ -152,9 +152,11 @@ where
 }
 
 /// Convert a complete line, as returned by a line cursor, to a `String`
-/// without its trailing `'\n'`.
+/// without its trailing `'\n'` or `"\r\n"` (as [`Fact::from_line`] accepts
+/// either).
 pub(crate) fn line_to_string(line: &[u8]) -> std::io::Result<String> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     String::from_utf8(line.to_vec())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }

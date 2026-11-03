@@ -25,7 +25,19 @@ use crate::StreamPosition;
 use std::time::Duration;
 use thiserror::Error;
 
+/// An error from writing to a fact stream with a [`FactStreamWriter`] (or
+/// the async writer, with the `tokio` feature).
+///
+/// [`Serialization`](Self::Serialization),
+/// [`AlreadyLocked`](Self::AlreadyLocked) and
+/// [`LockTimeout`](Self::LockTimeout) are reported before anything is
+/// written. After an [`Io`](Self::Io) error from a write, the batch may
+/// have been written in part or in full.
+///
+/// New variants may be added in minor releases, so a `match` needs a
+/// wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum WriteError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -44,7 +56,19 @@ pub enum WriteError {
     LockTimeout(Duration),
 }
 
+/// An error from reading a fact stream with a [`FactStreamReader`],
+/// [`read_lines_at`] or a store iterator (or their async twins, with the
+/// `tokio` feature).
+///
+/// A [`Deserialization`](Self::Deserialization) error is per line: the
+/// readers skip the line and can continue past it. An [`Io`](Self::Io)
+/// error is not. [`InvalidPosition`](Self::InvalidPosition) is reported
+/// when opening at a position that cannot belong to the stream.
+///
+/// New variants may be added in minor releases, so a `match` needs a
+/// wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ReadError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

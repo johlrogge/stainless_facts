@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 /// its own position.
 ///
 /// A position is opaque. It can be compared, hashed and persisted (it
-/// serializes as a plain integer), but it can only be obtained from this
-/// crate, never built from an arbitrary number. [`StreamPosition::START`] is
-/// the beginning of every stream.
+/// serializes as a plain integer), but it is created only by this crate or
+/// by deserializing a persisted one; readers validate positions on open.
+/// [`StreamPosition::START`] is the beginning of every stream.
 ///
 /// A position is only meaningful for the stream it came from. Readers
 /// reject a position that is past the end of the stream or not at the start

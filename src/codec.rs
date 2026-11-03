@@ -31,11 +31,18 @@ impl<E: Serialize, V: Serialize, S: Serialize> Fact<E, V, S> {
     /// writer's output is byte-identical to `to_line` followed by `'\n'`.
     ///
     /// ```
+    /// use serde::Serialize;
     /// use stainless_facts::{Fact, Operation};
+    ///
+    /// #[derive(Serialize)]
+    /// #[serde(tag = "t", content = "v")]
+    /// enum Attribute {
+    ///     Title(String),
+    /// }
     ///
     /// let fact = Fact::new(
     ///     "track-1".to_string(),
-    ///     "Line 1\nLine 2".to_string(),
+    ///     Attribute::Title("Line 1\nLine 2".to_string()),
     ///     "2024-01-01T00:00:00Z".parse().unwrap(),
     ///     "alice".to_string(),
     ///     Operation::Assert,
@@ -43,7 +50,7 @@ impl<E: Serialize, V: Serialize, S: Serialize> Fact<E, V, S> {
     /// let line = fact.to_line()?;
     /// assert_eq!(
     ///     line,
-    ///     r#"["track-1","Line 1\nLine 2","2024-01-01T00:00:00Z","alice","Assert"]"#
+    ///     r#"["track-1",{"t":"Title","v":"Line 1\nLine 2"},"2024-01-01T00:00:00Z","alice","Assert"]"#
     /// );
     /// # Ok::<(), serde_json::Error>(())
     /// ```

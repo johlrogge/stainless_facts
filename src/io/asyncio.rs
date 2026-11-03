@@ -273,10 +273,11 @@ impl<E, V, S> AsyncFactStreamReader<E, V, S> {
 /// Read up to `limit` raw lines from a fact stream, starting at `at`.
 ///
 /// The async twin of [`read_lines_at`](crate::read_lines_at), with the same
-/// semantics: lines without their `'\n'`, blank lines skipped and not
-/// counted, only complete lines, and the position to resume from. No lock
-/// is taken; a call that races a writer may return only a prefix of an
-/// in-progress batch, and the returned position is on a line boundary.
+/// semantics: lines without their `'\n'` (or `"\r\n"`), blank lines
+/// skipped and not counted, only complete lines, and the position to
+/// resume from. No lock is taken; a call that races a writer may return
+/// only a prefix of an in-progress batch, and the returned position is on
+/// a line boundary.
 ///
 /// # Errors
 ///

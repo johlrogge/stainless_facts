@@ -263,10 +263,10 @@ where
 /// Read up to `limit` raw lines from a fact stream, starting at `at`.
 ///
 /// This is a pass-through for relays that forward lines without decoding
-/// them. Lines are returned without their trailing `'\n'`. Blank lines are
-/// skipped and do not count toward `limit`. Only complete lines are
-/// returned: a trailing line without `'\n'` may still be being written, so
-/// it is left for a later call.
+/// them. Lines are returned without their trailing `'\n'` (or `"\r\n"`).
+/// Blank lines are skipped and do not count toward `limit`. Only complete
+/// lines are returned: a trailing line without `'\n'` may still be being
+/// written, so it is left for a later call.
 ///
 /// Returns the lines and the position to pass as `at` to read the next
 /// page. When no more complete lines are available, the lines are empty and

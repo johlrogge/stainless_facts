@@ -1,8 +1,3 @@
-// stainless-facts enhancement: FactStore with iter_from()
-// =======================================================
-//
-// Add to: src/store.rs (new file)
-
 use crate::{
     io::{FactStreamReader, FactStreamWriter, ReadError, WriteError},
     Fact, StreamPosition,
@@ -11,7 +6,6 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    io::BufRead,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -22,7 +16,19 @@ use thiserror::Error;
 /// [`FactStore::with_lock_timeout`] (or the async store's equivalent).
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// An error from a [`FactStore`] operation, or from an `AsyncFactStore`
+/// operation (with the `tokio` feature).
+///
+/// File-system errors of the store itself (creating its directory or file,
+/// opening it for reading) are [`Io`](Self::Io); errors from the stream
+/// writer and readers are wrapped in [`Write`](Self::Write) and
+/// [`Read`](Self::Read). [`TimestampOrdering`](Self::TimestampOrdering)
+/// rejects an append without writing anything.
+///
+/// New variants may be added in minor releases, so a `match` needs a
+/// wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum StoreError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -190,6 +196,21 @@ where
     /// position for [`read_at`](Self::read_at). If the store's file does
     /// not exist yet, an empty batch returns [`StreamPosition::START`]
     /// without creating it.
+    ///
+    /// The timestamps must be non-decreasing within the batch as well as
+    /// relative to the store's latest timestamp; equal timestamps are
+    /// allowed. Afterwards the latest timestamp is the batch's maximum.
+    ///
+    /// # Errors and the cached latest timestamp
+    ///
+    /// The cached latest timestamp is advanced to the batch's maximum
+    /// *before* the write. It is rolled back only on errors that prove
+    /// nothing was written ([`WriteError::AlreadyLocked`],
+    /// [`WriteError::LockTimeout`], [`WriteError::Serialization`], or an
+    /// error opening the file). After any other error, the batch may have
+    /// been written in part or in full, so the cache stays conservatively
+    /// ahead: a later append earlier than this batch's maximum is rejected.
+    /// Ordering is preserved because the cache is advanced first.
     pub fn append_batch(&self, facts: &[Fact<E, V, S>]) -> Result<StreamPosition, StoreError> {
         // Held across the check, the write and the cache update, so that
         // concurrent appends cannot pass the check and then write out of
@@ -210,27 +231,22 @@ where
             };
         }
 
-        if let Some(latest_ts) = *latest {
-            for fact in facts {
-                if fact.timestamp() < &latest_ts {
-                    return Err(StoreError::TimestampOrdering {
-                        new: *fact.timestamp(),
-                        latest: latest_ts,
-                    });
-                }
-            }
-        }
+        let previous = *latest;
+        let batch_max = check_batch_order(previous, facts)?;
 
         // The writer takes the exclusive file lock for the write, waiting up
         // to `lock_timeout` for writers in other processes.
         let mut writer = FactStreamWriter::open_with_timeout(&self.path, self.lock_timeout)?;
-        let position = writer.write_batch(facts)?;
 
-        if let Some(last_fact) = facts.last() {
-            *latest = Some(*last_fact.timestamp());
-        }
-
-        Ok(position)
+        // Advanced before the write, so the cache never falls behind the
+        // disk; rolled back only if the write provably did not happen.
+        *latest = batch_max;
+        writer.write_batch(facts).map_err(|e| {
+            if nothing_written(&e) {
+                *latest = previous;
+            }
+            e.into()
+        })
     }
 
     /// Read the facts after position `at`.
@@ -248,15 +264,16 @@ where
     ///
     /// # Errors
     ///
-    /// [`StoreError::Read`] with [`ReadError::InvalidPosition`] if `at` is
-    /// past the end of the stream or not at the start of a line.
+    /// - [`StoreError::Read`] with [`ReadError::InvalidPosition`] if `at` is
+    ///   past the end of the stream or not at the start of a line.
+    /// - [`StoreError::Io`] if the file cannot be created or opened.
     pub fn read_at(&self, at: StreamPosition) -> Result<FactStreamReader<E, V, S>, StoreError> {
         // Make sure the file exists, without touching its contents.
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        Ok(FactStreamReader::open_at(&self.path, at)?)
+        FactStreamReader::open_at(&self.path, at).map_err(reader_open_error)
     }
 
     /// Get the latest timestamp in the store.
@@ -296,28 +313,74 @@ where
         FactIterator::new(&self.path, since)
     }
 
-    /// Read the latest timestamp from the file without caching.
+    /// Read the latest (maximum) timestamp from the file without caching.
     ///
-    /// Unlike [`iter`](Self::iter), this skips lines that fail to decode
+    /// Reads with a [`FactStreamReader`], so only complete lines count: an
+    /// unterminated tail is ignored. Unlike [`iter`](Self::iter), this skips
+    /// lines that fail to decode (including lines that are not valid UTF-8)
     /// rather than reporting them, so a malformed line does not prevent
-    /// opening the store. I/O errors still fail.
+    /// opening the store. I/O errors still fail. O(n), but done only once,
+    /// on open.
     fn read_latest_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>, StoreError> {
-        let file = std::fs::File::open(path)?;
-        let mut reader = std::io::BufReader::new(file);
-
-        let mut last_timestamp = None;
-        let mut line = String::new();
-
-        // Read through file, keeping track of last timestamp
-        // This is O(n) but only done once at startup
-        while reader.read_line(&mut line).map_err(ReadError::from)? > 0 {
-            if let Ok(fact) = Fact::<E, V, S>::from_line(&line) {
-                last_timestamp = Some(*fact.timestamp());
+        let reader = FactStreamReader::<E, V, S>::open(path).map_err(reader_open_error)?;
+        let mut latest = None;
+        for item in reader {
+            match item {
+                Ok(fact) => latest = latest.max(Some(*fact.timestamp())),
+                Err(ReadError::Deserialization(_)) => continue,
+                Err(e) => return Err(e.into()),
             }
-            line.clear();
         }
+        Ok(latest)
+    }
+}
 
-        Ok(last_timestamp)
+/// Check that `facts` can follow a stream whose latest timestamp is
+/// `latest`: each fact's timestamp is at or after the one before it
+/// (starting from `latest`). Equal timestamps are allowed.
+///
+/// Returns the latest timestamp once the batch is appended, which is the
+/// batch's maximum (or `latest` for an empty batch).
+///
+/// # Errors
+///
+/// [`StoreError::TimestampOrdering`] for the first fact that is earlier
+/// than the one before it, with `latest` set to that previous timestamp.
+pub(crate) fn check_batch_order<E, V, S>(
+    latest: Option<DateTime<Utc>>,
+    facts: &[Fact<E, V, S>],
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let mut prev = latest;
+    for fact in facts {
+        let new = *fact.timestamp();
+        if let Some(prev) = prev {
+            if new < prev {
+                return Err(StoreError::TimestampOrdering { new, latest: prev });
+            }
+        }
+        prev = Some(new);
+    }
+    Ok(prev)
+}
+
+/// Whether a failed [`write_batch`](FactStreamWriter::write_batch) proves
+/// that nothing was written: the lock was never taken, or the batch failed
+/// to encode (which happens before the lock is taken). Any other error may
+/// follow a partial or complete write.
+pub(crate) fn nothing_written(e: &WriteError) -> bool {
+    matches!(
+        e,
+        WriteError::AlreadyLocked | WriteError::LockTimeout(_) | WriteError::Serialization(_)
+    )
+}
+
+/// Convert an error opening a reader: I/O errors become [`StoreError::Io`],
+/// like the other file-system errors of the store, and the rest (such as
+/// [`ReadError::InvalidPosition`]) [`StoreError::Read`].
+pub(crate) fn reader_open_error(e: ReadError) -> StoreError {
+    match e {
+        ReadError::Io(e) => StoreError::Io(e),
+        e => StoreError::Read(e),
     }
 }
 
@@ -697,6 +760,160 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+        assert!(dir.path().join("facts.stream").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_at_open_failure_is_an_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        // Write-only: the existence check (an append open) succeeds, but
+        // opening for reading fails.
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o200)).unwrap();
+        if std::fs::File::open(temp.path()).is_ok() {
+            // Running with privileges that bypass permissions.
+            return;
+        }
+
+        let result = store.read_at(StreamPosition::START);
+        assert!(
+            matches!(&result, Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "expected StoreError::Io(PermissionDenied), got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_check_batch_order_returns_the_max_and_rejects_the_first_violation() {
+        let batch = [count_fact(1, at("10:05:00")), count_fact(2, at("10:00:00"))];
+        let result = check_batch_order(Some(at("09:00:00")), &batch);
+        assert!(
+            matches!(result, Err(StoreError::TimestampOrdering { new, latest })
+                if new == at("10:00:00") && latest == at("10:05:00")),
+            "got {result:?}"
+        );
+
+        let equal = [count_fact(1, at("10:00:00")), count_fact(2, at("10:00:00"))];
+        assert_eq!(
+            check_batch_order(Some(at("10:00:00")), &equal).unwrap(),
+            Some(at("10:00:00"))
+        );
+        assert_eq!(
+            check_batch_order::<String, TestValue, String>(Some(at("09:00:00")), &[]).unwrap(),
+            Some(at("09:00:00"))
+        );
+        assert_eq!(
+            check_batch_order(None, &[count_fact(1, at("10:00:00"))]).unwrap(),
+            Some(at("10:00:00"))
+        );
+    }
+
+    #[test]
+    fn test_out_of_order_batch_is_rejected_and_nothing_is_written() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        store.append(count_fact(0, at("09:00:00"))).unwrap();
+        let len_before = std::fs::metadata(temp.path()).unwrap().len();
+
+        let result =
+            store.append_batch(&[count_fact(1, at("10:05:00")), count_fact(2, at("10:00:00"))]);
+        assert!(
+            matches!(result, Err(StoreError::TimestampOrdering { new, latest })
+                if new == at("10:00:00") && latest == at("10:05:00")),
+            "got {result:?}"
+        );
+        assert_eq!(std::fs::metadata(temp.path()).unwrap().len(), len_before);
+        assert_eq!(store.latest_timestamp(), Some(at("09:00:00")));
+    }
+
+    #[test]
+    fn test_batch_with_equal_timestamps_is_accepted() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        store.append(count_fact(0, at("09:00:00"))).unwrap();
+
+        let batch = [count_fact(1, at("10:00:00")), count_fact(2, at("10:00:00"))];
+        store.append_batch(&batch).unwrap();
+        assert_eq!(store.latest_timestamp(), Some(at("10:00:00")));
+    }
+
+    #[test]
+    fn test_lock_timeout_rolls_the_cache_back() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> = FactStore::open_or_create(temp.path())
+            .unwrap()
+            .with_lock_timeout(std::time::Duration::from_millis(100));
+        store.append(count_fact(0, at("10:00:00"))).unwrap();
+
+        use fs2::FileExt;
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let result = store.append(count_fact(1, at("10:05:00")));
+        assert!(
+            matches!(result, Err(StoreError::Write(WriteError::LockTimeout(_)))),
+            "expected LockTimeout, got {result:?}"
+        );
+        FileExt::unlock(&holder).unwrap();
+
+        // Nothing was written, so the failed batch's max is forgotten.
+        assert_eq!(store.latest_timestamp(), Some(at("10:00:00")));
+        store.append(count_fact(2, at("10:02:00"))).unwrap();
+        assert_eq!(store.latest_timestamp(), Some(at("10:02:00")));
+    }
+
+    #[test]
+    fn test_reopen_skips_non_utf8_lines_and_ignores_an_unterminated_tail() {
+        let temp = NamedTempFile::new().unwrap();
+        let a = count_fact(1, at("10:00:00"));
+        let b = count_fact(2, at("10:01:00"));
+        let tail = count_fact(3, at("10:09:00"));
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap();
+            writeln!(file, "{}", a.to_line().unwrap()).unwrap();
+            file.write_all(b"\xff\n").unwrap();
+            writeln!(file, "{}", b.to_line().unwrap()).unwrap();
+            // A complete fact, but no newline yet: not part of the stream.
+            write!(file, "{}", tail.to_line().unwrap()).unwrap();
+        }
+
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        assert_eq!(store.latest_timestamp(), Some(*b.timestamp()));
+    }
+
+    #[test]
+    fn test_reopen_takes_the_max_timestamp() {
+        let temp = NamedTempFile::new().unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(temp.path())
+                .unwrap();
+            for fact in [
+                count_fact(1, at("10:00:00")),
+                count_fact(2, at("10:05:00")),
+                count_fact(3, at("10:01:00")),
+            ] {
+                writeln!(file, "{}", fact.to_line().unwrap()).unwrap();
+            }
+        }
+
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        assert_eq!(store.latest_timestamp(), Some(at("10:05:00")));
     }
 
     #[test]
