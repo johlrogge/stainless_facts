@@ -38,7 +38,6 @@ use chrono::{DateTime, Utc};
 use serde::de::{DeserializeOwned, Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
@@ -102,12 +101,15 @@ impl<E, V, S> Fact<E, V, S> {
 }
 
 /// Represents an unknown attribute that wasn't recognized during deserialization.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// A missing `v` (as written for a unit variant, `{"t":"X"}`) decodes as
+/// `null` and is re-emitted as `{"t":"X","v":null}`, so a relay that decodes
+/// and re-serializes a unit-variant attribute adds an explicit `"v":null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnknownAttribute {
     /// The attribute name as a string
     pub t: String,
-    /// The value as a generic JSON value. A missing `v` (as written for a
-    /// unit variant, `{"t":"X"}`) decodes as `null`.
+    /// The value as a generic JSON value. A missing `v` decodes as `null`.
     #[serde(default)]
     pub v: JsonValue,
 }
@@ -119,13 +121,16 @@ pub struct UnknownAttribute {
 /// evolution): deserialize the stream as [`OpenFact`] instead of [`Fact`] and
 /// fold it with [`aggregate_open_facts_into`].
 ///
+/// JSON-only: deserialization goes via [`serde_json::Value`], so `Attr` is
+/// meant for JSON input and does not support other serde formats.
+///
 /// # Classification
 ///
 /// Deserializing an `Attr<V>` reads the attribute JSON once, then:
 ///
 /// 1. if `V` can decode it, it is [`Attr::Known`];
-/// 2. otherwise, if it is an object with a string `t` (and an optional `v`,
-///    which defaults to `null`), it is [`Attr::Unknown`];
+/// 2. otherwise, if it is an object with a string `t`, an optional `v`
+///    (which defaults to `null`) and no other keys, it is [`Attr::Unknown`];
 /// 3. otherwise it is a deserialization error.
 ///
 /// So `Unknown` means "this reader's `V` cannot decode it": that covers a tag
@@ -136,14 +141,16 @@ pub struct UnknownAttribute {
 /// Only the attribute is lenient. A line that is not valid JSON, an outer
 /// array that does not have exactly five elements, an entity, timestamp,
 /// source or operation that does not decode, or an attribute that is not an
-/// object with a string `t`, is still an error.
+/// object with a string `t` and no keys other than `t` and `v`, is still an
+/// error.
 ///
 /// Serialization is untagged: `Known(v)` serializes as `v` and `Unknown(u)`
 /// as `{"t": .., "v": ..}`, so an unknown fact is re-emitted as equivalent
-/// JSON. Object keys nested inside `v` may come out in a different order;
-/// relays that need byte-exact pass-through should forward raw lines instead
-/// of decoding them.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// JSON, with one caveat: an unknown attribute written without `v` (a unit
+/// variant, `{"t":"X"}`) is re-emitted as `{"t":"X","v":null}`. Object keys
+/// nested inside `v` may come out in a different order; relays that need
+/// byte-exact pass-through should forward raw lines instead of decoding them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum Attr<V> {
     /// An attribute this reader's `V` decodes.
@@ -154,15 +161,19 @@ pub enum Attr<V> {
 
 impl<'de, V: DeserializeOwned> Deserialize<'de> for Attr<V> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        const MALFORMED: &str = "attribute must be an object with a string `t`";
+        const MALFORMED: &str =
+            "attribute must be an object with a string `t`, an optional `v` and no other keys";
 
         let value = JsonValue::deserialize(deserializer)?;
         if let Ok(known) = V::deserialize(&value) {
             return Ok(Attr::Known(known));
         }
         // A derived struct also accepts a sequence (`["X", 1]`), so require an
-        // object explicitly.
-        if !value.is_object() {
+        // object explicitly, and one with no keys besides `t` and `v`.
+        let Some(object) = value.as_object() else {
+            return Err(D::Error::custom(MALFORMED));
+        };
+        if object.keys().any(|key| key != "t" && key != "v") {
             return Err(D::Error::custom(MALFORMED));
         }
         UnknownAttribute::deserialize(value)
@@ -261,8 +272,10 @@ where
     A: FactAggregator<E, V, S> + Default,
     I: IntoIterator<Item = Fact<E, V, S>>,
 {
+    // Same fold as `aggregate_facts_into`, without building a touched set
+    // that would only be thrown away.
     let mut aggregates = HashMap::new();
-    aggregate_facts_into(&mut aggregates, facts);
+    fold_into_with::<E, V, S, A, _>(&mut aggregates, facts, |_| A::default(), drop);
     aggregates
 }
 
@@ -282,14 +295,18 @@ where
 ///
 /// # Touched set
 ///
-/// The returned set contains exactly the keys whose map state this call
-/// changed: inserted, mutated (a fact was dispatched to the aggregate), or
-/// removed. A touched key that is absent from the map afterwards has been
-/// retired: a Retract left it reporting [`FactAggregator::is_retired`], and
-/// no later Assert in `facts` recreated it. A Retract against an absent key
-/// is excluded, because nothing changed. Keys not in the set were left
-/// exactly as they were, so a caller only needs to revisit (for example with
+/// The returned set contains every key to which at least one fact was
+/// dispatched. It is a superset of the keys whose map state this call
+/// changed: an aggregate a fact was dispatched to may have ended up equal to
+/// what it was before, and its key is still touched. Keys not in the set are
+/// guaranteed unchanged, so a caller only needs to revisit (for example with
 /// [`retain_touched`]) the touched keys.
+///
+/// A touched key that is absent from the map afterwards was retired: a
+/// Retract left it reporting [`FactAggregator::is_retired`], and no later
+/// Assert in `facts` recreated it. It may also have been absent before this
+/// call, if it was created and retired within it. A Retract against an
+/// absent key is not dispatched and does not touch the key.
 pub fn aggregate_facts_into<E, V, S, A, I>(aggregates: &mut HashMap<E, A>, facts: I) -> HashSet<E>
 where
     E: Eq + Hash + Clone,
@@ -302,7 +319,7 @@ where
 /// Like [`aggregate_facts_into`], but new entities are built by `init`, which
 /// receives the entity key.
 ///
-/// This works like [`Entry::or_insert_with_key`]: `init(&key)` is called only
+/// This works like [`Entry::or_insert_with_key`](std::collections::hash_map::Entry::or_insert_with_key): `init(&key)` is called only
 /// when an Assert reaches an entity with no aggregate in the map. That covers
 /// a brand-new entity and one that was retired earlier (see
 /// [`FactAggregator::is_retired`]). It is not called for entities already in
@@ -322,7 +339,7 @@ where
     A: FactAggregator<E, V, S>,
     I: IntoIterator<Item = Fact<E, V, S>>,
 {
-    fold_into_with::<E, V, S, A, _>(aggregates, facts, init)
+    fold_into_touched::<E, V, S, A, _>(aggregates, facts, init)
 }
 
 /// Fold [`OpenFact`]s (in log order) into existing `aggregates`. Returns the
@@ -423,7 +440,7 @@ where
     A: FactAggregator<E, V, S>,
     I: IntoIterator<Item = OpenFact<E, V, S>>,
 {
-    fold_into_with::<E, V, S, A, _>(aggregates, facts, init)
+    fold_into_touched::<E, V, S, A, _>(aggregates, facts, init)
 }
 
 mod sealed {
@@ -436,7 +453,9 @@ mod sealed {
     pub trait FoldItem<E, V, S> {
         fn entity(&self) -> &E;
         fn operation(&self) -> Operation;
-        fn dispatch<A: FactAggregator<E, V, S>>(self, aggregate: &mut A);
+        /// Dispatch to `aggregate` and hand the entity back, so the fold can
+        /// remove or record the key without cloning it.
+        fn dispatch<A: FactAggregator<E, V, S>>(self, aggregate: &mut A) -> E;
     }
 
     impl<E, V, S> FoldItem<E, V, S> for Fact<E, V, S> {
@@ -448,8 +467,9 @@ mod sealed {
             Fact::operation(self)
         }
 
-        fn dispatch<A: FactAggregator<E, V, S>>(self, aggregate: &mut A) {
+        fn dispatch<A: FactAggregator<E, V, S>>(self, aggregate: &mut A) -> E {
             aggregate.apply(&self);
+            self.into_parts().0
         }
     }
 
@@ -462,14 +482,19 @@ mod sealed {
             Fact::operation(self)
         }
 
-        fn dispatch<A: FactAggregator<E, V, S>>(self, aggregate: &mut A) {
+        fn dispatch<A: FactAggregator<E, V, S>>(self, aggregate: &mut A) -> E {
             let (entity, value, timestamp, source, operation) = self.into_parts();
             match value {
                 Attr::Known(value) => {
-                    aggregate.apply(&Fact::new(entity, value, timestamp, source, operation))
+                    let fact = Fact::new(entity, value, timestamp, source, operation);
+                    aggregate.apply(&fact);
+                    fact.into_parts().0
                 }
-                Attr::Unknown(unknown) => aggregate
-                    .apply_unknown(&Fact::new(entity, unknown, timestamp, source, operation)),
+                Attr::Unknown(unknown) => {
+                    let fact = Fact::new(entity, unknown, timestamp, source, operation);
+                    aggregate.apply_unknown(&fact);
+                    fact.into_parts().0
+                }
             }
         }
     }
@@ -483,13 +508,52 @@ use sealed::FoldItem;
 /// Per item, in order: dispatch to the existing aggregate if there is one;
 /// otherwise skip a Retract (no insert, no `init`, not touched) or insert
 /// `init(&key)` for an Assert and dispatch to it. Every dispatched key is
-/// recorded in the returned touched set. After a dispatched Retract (known or
-/// unknown), an aggregate reporting [`FactAggregator::is_retired`] is
-/// removed; its key stays touched.
+/// passed to `touch` (once per dispatched item, so possibly repeatedly).
+/// After a dispatched Retract (known or unknown), an aggregate reporting
+/// [`FactAggregator::is_retired`] is removed; its key is still passed to
+/// `touch`.
+///
+/// The key is cloned only when an Assert inserts a new entry; a hit, and
+/// the hand-off to `touch`, reuse the item's own entity.
 fn fold_into_with<E, V, S, A, T>(
     aggregates: &mut HashMap<E, A>,
     items: impl IntoIterator<Item = T>,
     mut init: impl FnMut(&E) -> A,
+    mut touch: impl FnMut(E),
+) where
+    E: Eq + Hash + Clone,
+    A: FactAggregator<E, V, S>,
+    T: FoldItem<E, V, S>,
+{
+    for item in items {
+        let is_retract = item.operation() == Operation::Retract;
+        let (entity, retired) = match aggregates.get_mut(item.entity()) {
+            Some(aggregate) => {
+                let entity = item.dispatch(aggregate);
+                (entity, is_retract && aggregate.is_retired())
+            }
+            None if is_retract => continue,
+            None => {
+                // An Assert never retires, so `is_retired` is not checked.
+                let aggregate = aggregates
+                    .entry(item.entity().clone())
+                    .or_insert_with_key(&mut init);
+                (item.dispatch(aggregate), false)
+            }
+        };
+
+        if retired {
+            aggregates.remove(&entity);
+        }
+        touch(entity);
+    }
+}
+
+/// Run [`fold_into_with`], collecting the touched keys into a set.
+fn fold_into_touched<E, V, S, A, T>(
+    aggregates: &mut HashMap<E, A>,
+    items: impl IntoIterator<Item = T>,
+    init: impl FnMut(&E) -> A,
 ) -> HashSet<E>
 where
     E: Eq + Hash + Clone,
@@ -497,27 +561,9 @@ where
     T: FoldItem<E, V, S>,
 {
     let mut touched = HashSet::new();
-
-    for item in items {
-        let key = item.entity().clone();
-        let is_retract = item.operation() == Operation::Retract;
-        let aggregate = match aggregates.entry(key.clone()) {
-            Entry::Occupied(slot) => slot.into_mut(),
-            Entry::Vacant(_) if is_retract => continue,
-            Entry::Vacant(slot) => {
-                let fresh = init(slot.key());
-                slot.insert(fresh)
-            }
-        };
-        item.dispatch(aggregate);
-        let retired = is_retract && aggregate.is_retired();
-
-        if retired {
-            aggregates.remove(&key);
-        }
-        touched.insert(key);
-    }
-
+    fold_into_with::<E, V, S, A, T>(aggregates, items, init, |entity| {
+        touched.insert(entity);
+    });
     touched
 }
 
@@ -528,7 +574,8 @@ where
 /// `aggregates`, with the key and its aggregate; entries for which it returns
 /// `false` are removed. Entries whose key is not in `touched` are never
 /// visited or removed. Touched keys that are absent from the map (retired
-/// entities, see [`aggregate_facts_into`]) are skipped.
+/// entities, see [`aggregate_facts_into`]) are skipped. The order in which
+/// `keep` is called is unspecified.
 pub fn retain_touched<E: Eq + Hash, A>(
     aggregates: &mut HashMap<E, A>,
     touched: &HashSet<E>,
@@ -1082,7 +1129,7 @@ mod tests {
 
         /// The reader's view of the schema. A newer writer may emit tags this
         /// reader doesn't know, or change a payload type.
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(tag = "t", content = "v")]
         enum Song {
             Title(String),
@@ -1501,6 +1548,24 @@ mod tests {
             assert_eq!(fact.value(), &unknown("Pinned", JsonValue::Null));
         }
 
+        #[test]
+        fn unknown_unit_variant_is_re_emitted_with_null_v() {
+            let attr: Attr<Song> = serde_json::from_str(r#"{"t":"Pinned"}"#).unwrap();
+
+            assert_eq!(
+                serde_json::to_string(&attr).unwrap(),
+                r#"{"t":"Pinned","v":null}"#
+            );
+        }
+
+        #[test]
+        fn open_fact_is_eq_when_its_parameters_are() {
+            fn assert_eq_impl<T: Eq>() {}
+            assert_eq_impl::<UnknownAttribute>();
+            assert_eq_impl::<Attr<Song>>();
+            assert_eq_impl::<Open>();
+        }
+
         #[rstest]
         #[case::invalid_json(r#"["a",{"t":"Title","v":"x"},"2024-01-01T00:00:00Z","v1","Assert""#)]
         #[case::not_json_at_all("not json")]
@@ -1522,6 +1587,9 @@ mod tests {
         #[case::attribute_without_t(r#"["a",{"v":5},"2024-01-01T00:00:00Z","v1","Assert"]"#)]
         #[case::attribute_with_non_string_t(
             r#"["a",{"t":5,"v":5},"2024-01-01T00:00:00Z","v1","Assert"]"#
+        )]
+        #[case::attribute_with_extra_keys(
+            r#"["a",{"t":"Rating","v":5,"x":1},"2024-01-01T00:00:00Z","v1","Assert"]"#
         )]
         fn truly_malformed_lines_are_errors_not_unknown_attributes(#[case] line: &str) {
             let result = serde_json::from_str::<Open>(line);

@@ -333,7 +333,7 @@ fn apply(&mut self, fact: &Fact<String, MusicValue, String>) {
 
 ### Incremental Folding
 
-`aggregate_facts_into` folds new facts into an existing map and returns the touched set: the keys it inserted, changed or removed. A retract against an unknown entity is a no-op (no entry, not touched). Folding a suffix into the fold of a prefix gives the same map as folding everything. `retain_touched` then sweeps only those keys:
+`aggregate_facts_into` folds new facts into an existing map and returns the touched set: every key at least one fact was dispatched to, a superset of the keys whose state changed. Keys not in the set are guaranteed unchanged. A retract against an unknown entity is a no-op (no entry, not touched). Folding a suffix into the fold of a prefix gives the same map as folding everything. `retain_touched` then sweeps only those keys:
 
 ```rust
 use stainless_facts::{aggregate_facts_into, retain_touched};
@@ -359,7 +359,7 @@ let touched = aggregate_facts_into_with(&mut tracks, new_facts, |id: &String| Tr
 
 ## Unknown Attributes (Schema Evolution)
 
-A reader whose value enum predates a newer writer would fail to deserialize the new attributes. Read the stream as `OpenFact<E, V, S>` instead: an attribute `V` cannot decode becomes `Attr::Unknown(UnknownAttribute { t, v })` (a missing `v` is `null`) rather than an error. This includes a known tag whose payload changed type; deserialize plain `Fact` if you want that to be an error. Anything that is not an object with a string `t` is still an error.
+A reader whose value enum predates a newer writer would fail to deserialize the new attributes. Read the stream as `OpenFact<E, V, S>` instead: an attribute `V` cannot decode becomes `Attr::Unknown(UnknownAttribute { t, v })` (a missing `v` is `null`, and is re-emitted as `"v":null`) rather than an error. This includes a known tag whose payload changed type; deserialize plain `Fact` if you want that to be an error. Anything that is not an object with a string `t` and no keys other than `t` and `v` is still an error.
 
 Fold open facts with `aggregate_open_facts_into` (or `aggregate_open_facts_into_with` for keyed init). Known facts go to `apply`; unknown ones go to `apply_unknown`, which by default calls `assert_unknown`/`retract_unknown`:
 
