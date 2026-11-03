@@ -28,12 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING**: `FactStore` and `AsyncFactStore` iterators (`iter`, `iter_from`) yield `Result<Fact, ReadError>` instead of `Fact` (#8)
 - **BREAKING**: `StoreError` is one type shared by `FactStore` and `AsyncFactStore` (#8)
 - `iter_from(timestamp)` is documented as a time-travel query, not an efficient sync; use `read_at(position)` to sync (#5)
+- **BREAKING**: `WriteError`, `ReadError` and `StoreError` are `#[non_exhaustive]`
+- **BREAKING**: `append_batch` rejects a batch whose timestamps go backwards within the batch (`TimestampOrdering`). Previously such a batch was written
+- Writers repair a torn tail (a file not ending in `'\n'`) by prefixing `'\n'`, so the fragment becomes one malformed line that readers skip
+- Writers need read permission on the file
+- An empty `append_batch` takes the file lock and returns a line-boundary position
+- `read_lines_at` strips `"\r\n"`
+- Dropping an async `write_batch`/`append_batch` future no longer cancels a write that has started: the batch lands and the lock is released afterwards
+- The store timestamp cache is advanced before writing, so ordering holds even when an append is cancelled
 
 ### Fixed
 - A long-lived reader no longer blocks writers (#9)
 - Concurrent appends to one store no longer race the timestamp-ordering check or fail with `AlreadyLocked`: appends are serialized by a store mutex and wait up to the lock timeout (#9)
 - Store iterators no longer silently stop at a malformed line or an I/O error; they yield an `Err` and continue (#8)
 - The writer lock is released between writes, so concurrent reads are possible (2aa820a)
+- A cancelled async write no longer leaks the exclusive file lock
+- Non-contention lock errors (e.g. `ENOLCK`) surface as `Io` instead of a misleading `LockTimeout`
+- `open_or_create` no longer fails on a non-UTF-8 line
+- The latest-timestamp cache uses the batch max
 - The io stream tests were never compiled; they now run in CI. CI also lints with clippy `--all-targets` and checks the core build on `wasm32-unknown-unknown`
 
 ### Internal
@@ -47,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `.await` to `AsyncFactStore::latest_timestamp`.
 - Code that names the `()` result of `write_batch`/`append`/`append_batch` must expect `StreamPosition`; `append(f)?;` still compiles.
 - For syncing, persist the `StreamPosition` returned by writes (or `FactStreamReader::position`) and resume with `read_at(position)` instead of `iter_from(timestamp)`.
+- Match `WriteError`, `ReadError` and `StoreError` with a wildcard arm; they are `#[non_exhaustive]`.
 
 ## [0.2.0] - 2025-10-14
 

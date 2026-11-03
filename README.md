@@ -295,7 +295,7 @@ Reads never block writes:
 
 ### Timestamp Ordering
 
-`FactStore` enforces strict timestamp ordering. Facts with timestamps older than the latest fact in the store will be rejected:
+`FactStore` enforces timestamp ordering. A batch is rejected as a whole, with nothing written, if any fact is older than the latest fact in the store or older than the fact before it in the same batch. Equal timestamps are allowed:
 
 ```rust
 // This will fail if facts are out of order
