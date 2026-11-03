@@ -4,11 +4,12 @@
 // Add to: src/async_store.rs (new file)
 
 use crate::io::{AsyncFactStreamReader, AsyncFactStreamWriter, ReadError, WriteError};
+use crate::store::DEFAULT_LOCK_TIMEOUT;
 use crate::{Fact, StreamPosition};
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -36,8 +37,18 @@ pub enum StoreError {
 /// - Thread-safe appending of facts with timestamp validation
 /// - Resumable reads from a [`StreamPosition`] with [`read_at`](Self::read_at)
 /// - Async iteration from any timestamp
-/// - Read-write locking for concurrent access
 /// - Async file I/O with tokio
+///
+/// # Concurrency
+///
+/// The same as [`FactStore`](crate::FactStore): appends through one store
+/// are serialized by a `tokio::sync::Mutex` held across the timestamp
+/// check, the write and the cache update, so concurrent tasks cannot pass
+/// the check and then write out of order. Each write also takes the
+/// stream's exclusive file lock, waiting up to the store's lock timeout
+/// ([`DEFAULT_LOCK_TIMEOUT`](crate::store::DEFAULT_LOCK_TIMEOUT) unless set
+/// with [`with_lock_timeout`](Self::with_lock_timeout)) for writers in
+/// other processes. Readers take no lock.
 ///
 /// # Examples
 ///
@@ -78,8 +89,10 @@ pub enum StoreError {
 /// ```
 pub struct AsyncFactStore<E, V, S> {
     path: PathBuf,
-    /// Latest timestamp, cached for quick access
-    latest_timestamp: RwLock<Option<DateTime<Utc>>>,
+    /// Latest timestamp, cached for quick access. The guard is held for the
+    /// whole append, across `.await`, so it also serializes appends.
+    latest_timestamp: tokio::sync::Mutex<Option<DateTime<Utc>>>,
+    lock_timeout: Duration,
     _phantom: std::marker::PhantomData<(E, V, S)>,
 }
 
@@ -107,9 +120,26 @@ where
 
         Ok(Self {
             path,
-            latest_timestamp: RwLock::new(latest_timestamp),
+            latest_timestamp: tokio::sync::Mutex::new(latest_timestamp),
+            lock_timeout: DEFAULT_LOCK_TIMEOUT,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Set how long an append waits for another writer's file lock before
+    /// failing with [`WriteError::LockTimeout`].
+    ///
+    /// The default is [`DEFAULT_LOCK_TIMEOUT`](crate::store::DEFAULT_LOCK_TIMEOUT).
+    /// With [`Duration::ZERO`], an append fails at once with
+    /// [`WriteError::AlreadyLocked`] if the lock is held.
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
+    }
+
+    /// How long an append waits for another writer's file lock.
+    pub fn lock_timeout(&self) -> Duration {
+        self.lock_timeout
     }
 
     /// Append a single fact, enforcing timestamp ordering.
@@ -141,11 +171,13 @@ where
             };
         }
 
-        // Check timestamp ordering
-        let latest = *self.latest_timestamp.read();
+        // Held across the check, the write and the cache update, so that
+        // concurrent appends cannot pass the check and then write out of
+        // order.
+        let mut latest = self.latest_timestamp.lock().await;
 
-        for fact in facts {
-            if let Some(latest_ts) = latest {
+        if let Some(latest_ts) = *latest {
+            for fact in facts {
                 if fact.timestamp() < &latest_ts {
                     return Err(StoreError::TimestampOrdering {
                         new: *fact.timestamp(),
@@ -155,13 +187,13 @@ where
             }
         }
 
-        // Write facts (AsyncFactStreamWriter handles locking)
-        let mut writer = AsyncFactStreamWriter::open(&self.path).await?;
+        // The writer takes the exclusive file lock for the write, waiting up
+        // to `lock_timeout` for writers in other processes.
+        let mut writer =
+            AsyncFactStreamWriter::open_with_timeout(&self.path, self.lock_timeout).await?;
         let position = writer.write_batch(facts).await?;
 
-        // Update cached latest timestamp
         if let Some(last_fact) = facts.last() {
-            let mut latest = self.latest_timestamp.write();
             *latest = Some(*last_fact.timestamp());
         }
 
@@ -195,8 +227,10 @@ where
     }
 
     /// Get the latest timestamp in the store.
-    pub fn latest_timestamp(&self) -> Option<DateTime<Utc>> {
-        *self.latest_timestamp.read()
+    ///
+    /// Waits for an append in progress to finish.
+    pub async fn latest_timestamp(&self) -> Option<DateTime<Utc>> {
+        *self.latest_timestamp.lock().await
     }
 
     /// Iterate over all facts in the store.
@@ -361,7 +395,7 @@ mod tests {
         let store: AsyncFactStore<String, TestValue, String> =
             AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
-        assert_eq!(store.latest_timestamp(), None);
+        assert_eq!(store.latest_timestamp().await, None);
     }
 
     #[tokio::test]
@@ -373,10 +407,10 @@ mod tests {
         let facts = create_test_facts();
 
         store.append(facts[0].clone()).await.unwrap();
-        assert_eq!(store.latest_timestamp(), Some(*facts[0].timestamp()));
+        assert_eq!(store.latest_timestamp().await, Some(*facts[0].timestamp()));
 
         store.append(facts[1].clone()).await.unwrap();
-        assert_eq!(store.latest_timestamp(), Some(*facts[1].timestamp()));
+        assert_eq!(store.latest_timestamp().await, Some(*facts[1].timestamp()));
     }
 
     #[tokio::test]
@@ -495,7 +529,7 @@ mod tests {
                 AsyncFactStore::open_or_create(temp.path()).await.unwrap();
 
             // Latest timestamp should be restored
-            assert_eq!(store.latest_timestamp(), Some(*facts[0].timestamp()));
+            assert_eq!(store.latest_timestamp().await, Some(*facts[0].timestamp()));
 
             // Should be able to append next fact
             store.append(facts[1].clone()).await.unwrap();
@@ -604,5 +638,124 @@ mod tests {
             facts.push(fact);
         }
         assert_eq!(facts.len(), 0);
+    }
+
+    fn count_fact(n: u32, timestamp: DateTime<Utc>) -> Fact<String, TestValue, String> {
+        Fact::new(
+            format!("item{n}"),
+            TestValue::Count(n),
+            timestamp,
+            "source1".to_string(),
+            Operation::Assert,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_append_succeeds_while_a_reader_is_mid_iteration() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let facts = create_test_facts();
+        store.append_batch(&facts).await.unwrap();
+
+        let mut reader = store.read_at(StreamPosition::START).await.unwrap();
+        assert_eq!(reader.next().await.unwrap().unwrap(), facts[0]);
+        let mid = reader.position();
+
+        // The reader holds no lock, so the writer is not blocked.
+        let later = count_fact(4, "2024-01-15T10:03:00Z".parse().unwrap());
+        let end = store.append(later.clone()).await.unwrap();
+
+        // The same reader tails the stream and sees the new fact.
+        let mut rest = Vec::new();
+        while let Some(result) = reader.next().await {
+            rest.push(result.unwrap());
+        }
+        assert_eq!(rest, vec![facts[1].clone(), facts[2].clone(), later]);
+        assert_eq!(reader.position(), end);
+
+        // A reader reopened at the earlier position sees it too.
+        assert_eq!(
+            collect_reader(store.read_at(mid).await.unwrap()).await,
+            rest
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_lock_timeout_is_applied() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        assert_eq!(store.lock_timeout(), crate::store::DEFAULT_LOCK_TIMEOUT);
+
+        let store = store.with_lock_timeout(std::time::Duration::ZERO);
+        assert_eq!(store.lock_timeout(), std::time::Duration::ZERO);
+
+        use fs2::FileExt;
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let result = store.append(create_test_facts()[0].clone()).await;
+        assert!(
+            matches!(result, Err(StoreError::Write(WriteError::AlreadyLocked))),
+            "expected AlreadyLocked, got {result:?}"
+        );
+        FileExt::unlock(&holder).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_appends_all_land_in_timestamp_order() {
+        const TASKS: u32 = 8;
+        const PER_TASK: u32 = 25;
+
+        let temp = NamedTempFile::new().unwrap();
+        let store: std::sync::Arc<AsyncFactStore<String, TestValue, String>> =
+            std::sync::Arc::new(AsyncFactStore::open_or_create(temp.path()).await.unwrap());
+
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..PER_TASK {
+                    let n = t * PER_TASK + i;
+                    // See the sync test: a timestamp taken before the append
+                    // can lose the race and be rightly rejected; retry with a
+                    // fresh one. Any other error fails the test.
+                    loop {
+                        match store.append(count_fact(n, Utc::now())).await {
+                            Ok(_) => break,
+                            Err(StoreError::TimestampOrdering { .. }) => continue,
+                            Err(e) => panic!("append {n} failed: {e}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let written = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+        assert_eq!(written.len(), (TASKS * PER_TASK) as usize);
+        assert!(
+            written
+                .windows(2)
+                .all(|w| w[0].timestamp() <= w[1].timestamp()),
+            "facts are not in non-decreasing timestamp order"
+        );
+        let mut values: Vec<u32> = written
+            .iter()
+            .map(|f| match f.value() {
+                TestValue::Count(n) => *n,
+            })
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, (0..TASKS * PER_TASK).collect::<Vec<_>>());
+        assert_eq!(
+            store.latest_timestamp().await,
+            Some(*written.last().unwrap().timestamp())
+        );
     }
 }

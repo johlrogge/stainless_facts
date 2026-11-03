@@ -33,9 +33,13 @@ pub enum WriteError {
     #[error("Serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// Another writer holds the stream's exclusive lock and the writer was
+    /// opened with a zero lock timeout.
     #[error("File is already locked by another process")]
     AlreadyLocked,
 
+    /// Another writer held the stream's exclusive lock for longer than the
+    /// writer's lock timeout.
     #[error("Failed to acquire lock within {0:?}")]
     LockTimeout(Duration),
 }
@@ -47,12 +51,6 @@ pub enum ReadError {
 
     #[error("Deserialization failed: {0}")]
     Deserialization(#[from] serde_json::Error),
-
-    #[error("File is already locked by another process")]
-    AlreadyLocked,
-
-    #[error("Failed to acquire lock within {0:?}")]
-    LockTimeout(Duration),
 
     /// The position is past the end of the stream or not at the start of a
     /// line, so it cannot have come from this stream.

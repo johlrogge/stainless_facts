@@ -8,6 +8,20 @@ use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
+/// Appends batches of facts to a fact stream file asynchronously.
+///
+/// # Locking
+///
+/// The same as [`FactStreamWriter`](crate::FactStreamWriter): each
+/// [`write_batch`](Self::write_batch) takes an exclusive advisory file lock
+/// (via `fs2`) for the duration of the write, which serializes writers to
+/// the same file, including writers in other processes. While another
+/// writer holds the lock, the write waits with `tokio::time::sleep`
+/// between attempts. Readers take no lock.
+///
+/// On Windows, the lock is taken with `LockFileEx`, which is *mandatory*
+/// locking: while a write is in progress, reads of the file can block or
+/// fail.
 pub struct AsyncFactStreamWriter {
     sync_file: std::fs::File, // For locking
     file: File,
@@ -18,12 +32,17 @@ impl AsyncFactStreamWriter {
     /// Open a fact stream file for writing.
     ///
     /// The lock is acquired only during write operations, not continuously.
-    /// This allows readers to access the file between writes.
+    /// The lock timeout is zero: a write fails at once with
+    /// [`WriteError::AlreadyLocked`] if another writer holds the lock. Use
+    /// [`open_with_timeout`](Self::open_with_timeout) to wait instead.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, WriteError> {
         Self::open_with_timeout(path, Duration::from_secs(0)).await
     }
 
     /// Open with a timeout for acquiring the lock during writes.
+    ///
+    /// A write waits up to `timeout` for another writer to release the lock,
+    /// then fails with [`WriteError::LockTimeout`].
     pub async fn open_with_timeout(
         path: impl AsRef<Path>,
         timeout: Duration,
@@ -196,6 +215,15 @@ impl LineCursor {
 ///
 /// [`position`](Self::position) is where to resume reading later with
 /// [`open_at`](Self::open_at).
+///
+/// # Concurrency
+///
+/// The same as [`FactStreamReader`](crate::FactStreamReader): the reader
+/// takes no file lock and never blocks writers. A reader that races a
+/// writer may observe only a prefix of an in-progress batch, but its
+/// [`position`](Self::position) always stays on a line boundary. On
+/// Windows, writers' `LockFileEx` locks are mandatory, so a read can block
+/// or fail while a write is in progress.
 pub struct AsyncFactStreamReader<E, V, S> {
     cursor: LineCursor,
     _phantom: std::marker::PhantomData<(E, V, S)>,
@@ -204,8 +232,8 @@ pub struct AsyncFactStreamReader<E, V, S> {
 impl<E, V, S> AsyncFactStreamReader<E, V, S> {
     /// Open a fact stream file for reading from the start.
     ///
-    /// Acquires a shared lock immediately or fails. Equivalent to
-    /// [`open_at`](Self::open_at) with [`StreamPosition::START`].
+    /// Equivalent to [`open_at`](Self::open_at) with
+    /// [`StreamPosition::START`].
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, ReadError> {
         Self::open_at(path, StreamPosition::START).await
     }
@@ -213,56 +241,17 @@ impl<E, V, S> AsyncFactStreamReader<E, V, S> {
     /// Open a fact stream file for reading, starting at `at`.
     ///
     /// `at` should be a position returned by this stream's writer or
-    /// reader. Acquires a shared lock immediately or fails.
+    /// reader. No lock is taken.
     ///
     /// # Errors
     ///
     /// [`ReadError::InvalidPosition`] if `at` is past the end of the file or
     /// is not at the start of a line.
     pub async fn open_at(path: impl AsRef<Path>, at: StreamPosition) -> Result<Self, ReadError> {
-        Self::open_at_with_timeout(path, at, Duration::from_secs(0)).await
-    }
-
-    /// Open with a timeout for acquiring the lock.
-    pub async fn open_with_timeout(
-        path: impl AsRef<Path>,
-        timeout: Duration,
-    ) -> Result<Self, ReadError> {
-        Self::open_at_with_timeout(path, StreamPosition::START, timeout).await
-    }
-
-    async fn open_at_with_timeout(
-        path: impl AsRef<Path>,
-        at: StreamPosition,
-        timeout: Duration,
-    ) -> Result<Self, ReadError> {
-        let path = path.as_ref();
-
-        let sync_file = std::fs::OpenOptions::new().read(true).open(path)?;
-
-        let start = Instant::now();
-        let retry_interval = Duration::from_millis(100);
-
-        loop {
-            match FileExt::try_lock_shared(&sync_file) {
-                Ok(()) => {
-                    let cursor = LineCursor::open_at(File::from_std(sync_file), at).await?;
-                    return Ok(Self {
-                        cursor,
-                        _phantom: std::marker::PhantomData,
-                    });
-                }
-                Err(_) if timeout.is_zero() => {
-                    return Err(ReadError::AlreadyLocked);
-                }
-                Err(_) if start.elapsed() >= timeout => {
-                    return Err(ReadError::LockTimeout(timeout));
-                }
-                Err(_) => {
-                    tokio::time::sleep(retry_interval).await;
-                }
-            }
-        }
+        Ok(Self {
+            cursor: LineCursor::open_at(File::open(path).await?, at).await?,
+            _phantom: std::marker::PhantomData,
+        })
     }
 
     /// The position just past the last complete line consumed.
@@ -292,7 +281,9 @@ impl<E, V, S> AsyncFactStreamReader<E, V, S> {
 ///
 /// The async twin of [`read_lines_at`](crate::read_lines_at), with the same
 /// semantics: lines without their `'\n'`, blank lines skipped and not
-/// counted, only complete lines, and the position to resume from.
+/// counted, only complete lines, and the position to resume from. No lock
+/// is taken; a call that races a writer may return only a prefix of an
+/// in-progress batch, and the returned position is on a line boundary.
 ///
 /// # Errors
 ///
