@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
 ### Added
 - `FactAggregator::apply(&Fact)`, the single hook the folds call per fact. It sees the whole fact (entity, timestamp, source, operation); the default dispatches to `assert`/`retract` (#2)
 - `aggregate_facts_into` resumes a fold into an existing map and returns the touched set: every key to which at least one fact was dispatched, a superset of the keys whose map state changed. Keys not in the set are guaranteed unchanged. A retract against an absent entity is a no-op: it is not dispatched and not touched. `retain_touched` sweeps only the touched keys, so cost scales with the delta (#3)

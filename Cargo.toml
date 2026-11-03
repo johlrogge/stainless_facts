@@ -1,6 +1,6 @@
 [package]
 name = "stainless-facts"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Joakim Ohlrogge"]
 license = "MIT OR Apache-2.0"
@@ -11,6 +11,16 @@ readme = "README.md"
 keywords = ["facts", "event-sourcing", "datomic", "immutable", "schema-evolution"]
 categories = ["data-structures", "database"]
 rust-version = "1.99"
+# Ship only the crate itself: no devenv, editor or CI tooling.
+include = [
+    "/src/**/*.rs",
+    "/examples/**/*.rs",
+    "/tests/**/*.rs",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/APACHE-LICENSE",
+]
 
 [features]
 default = []
