@@ -23,6 +23,14 @@ where
     Ok(buffer)
 }
 
+/// Convert a complete line, as returned by a line cursor, to a `String`
+/// without its trailing `'\n'`.
+pub(crate) fn line_to_string(line: &[u8]) -> std::io::Result<String> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    String::from_utf8(line.to_vec())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,6 +14,10 @@
 mod codec;
 pub use codec::peek_entity;
 
+// Stream positions - core, no feature needed
+mod position;
+pub use position::StreamPosition;
+
 // Sync I/O - only with io feature
 #[cfg(feature = "io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "io")))]
@@ -24,7 +28,7 @@ pub mod store;
 
 #[cfg(feature = "io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "io")))]
-pub use io::{FactStreamReader, FactStreamWriter, ReadError, WriteError};
+pub use io::{read_lines_at, FactStreamReader, FactStreamWriter, ReadError, WriteError};
 #[cfg(feature = "io")]
 #[cfg_attr(docsrs, doc(cfg(feature = "io")))]
 pub use store::{FactIterator, FactStore, StoreError};
@@ -36,6 +40,9 @@ mod async_store;
 #[cfg(feature = "tokio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
 pub use async_store::{AsyncFactIterator, AsyncFactStore};
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use io::read_lines_at_async;
 
 // Core types
 use chrono::{DateTime, Utc};

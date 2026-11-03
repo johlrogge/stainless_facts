@@ -4,8 +4,8 @@
 // Add to: src/store.rs (new file)
 
 use crate::{
-    io::{FactStreamWriter, ReadError, WriteError},
-    Fact,
+    io::{FactStreamReader, FactStreamWriter, ReadError, WriteError},
+    Fact, StreamPosition,
 };
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
@@ -38,7 +38,8 @@ pub enum StoreError {
 ///
 /// The FactStore provides:
 /// - Thread-safe appending of facts with timestamp validation
-/// - Efficient iteration from any timestamp
+/// - Resumable reads from a [`StreamPosition`] with [`read_at`](Self::read_at)
+/// - Iteration from any timestamp
 /// - Read-write locking for concurrent access
 ///
 /// # Examples
@@ -67,7 +68,12 @@ pub enum StoreError {
 ///     "analyzer".to_string(),
 ///     Operation::Assert,
 /// );
-/// store.append(fact)?;
+/// let position = store.append(fact)?;
+///
+/// // Later: read only the facts appended after `position`
+/// for fact in store.read_at(position)? {
+///     println!("{:?}", fact?);
+/// }
 ///
 /// // Iterate from a timestamp
 /// let since = "2024-01-15T00:00:00Z".parse()?;
@@ -114,7 +120,10 @@ where
     }
 
     /// Append a single fact, enforcing timestamp ordering.
-    pub fn append(&self, fact: Fact<E, V, S>) -> Result<(), StoreError> {
+    ///
+    /// Returns the position just past the written fact; see
+    /// [`append_batch`](Self::append_batch).
+    pub fn append(&self, fact: Fact<E, V, S>) -> Result<StreamPosition, StoreError> {
         self.append_batch(&[fact])
     }
 
@@ -122,9 +131,18 @@ where
     ///
     /// All facts are written atomically. If any fact violates timestamp ordering,
     /// the entire batch is rejected.
-    pub fn append_batch(&self, facts: &[Fact<E, V, S>]) -> Result<(), StoreError> {
+    ///
+    /// Returns the position just past the batch, as returned by
+    /// [`FactStreamWriter::write_batch`]. Pass it to
+    /// [`read_at`](Self::read_at) to read only what was appended later. An
+    /// empty batch writes nothing and returns the current end of the stream.
+    pub fn append_batch(&self, facts: &[Fact<E, V, S>]) -> Result<StreamPosition, StoreError> {
         if facts.is_empty() {
-            return Ok(());
+            return match std::fs::metadata(&self.path) {
+                Ok(metadata) => Ok(StreamPosition::from_offset(metadata.len())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StreamPosition::START),
+                Err(e) => Err(e.into()),
+            };
         }
 
         // Check timestamp ordering
@@ -143,7 +161,7 @@ where
 
         // Write facts (FactStreamWriter handles locking)
         let mut writer = FactStreamWriter::open(&self.path)?;
-        writer.write_batch(facts)?;
+        let position = writer.write_batch(facts)?;
 
         // Update cached latest timestamp
         if let Some(last_fact) = facts.last() {
@@ -151,7 +169,33 @@ where
             *latest = Some(*last_fact.timestamp());
         }
 
-        Ok(())
+        Ok(position)
+    }
+
+    /// Read the facts after position `at`.
+    ///
+    /// `at` is a position returned by [`append`](Self::append),
+    /// [`append_batch`](Self::append_batch) or a reader's
+    /// [`position`](FactStreamReader::position), or
+    /// [`StreamPosition::START`]. This is the way to sync incrementally:
+    /// store the reader's position when you stop, and resume from it later.
+    /// Every fact is delivered exactly once, including facts in the same
+    /// batch or with the same timestamp.
+    ///
+    /// The reader tails the stream; see [`FactStreamReader`]. If the store's
+    /// file does not exist yet, it is created empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Read`] with [`ReadError::InvalidPosition`] if `at` is
+    /// past the end of the stream or not at the start of a line.
+    pub fn read_at(&self, at: StreamPosition) -> Result<FactStreamReader<E, V, S>, StoreError> {
+        // Make sure the file exists, without touching its contents.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        Ok(FactStreamReader::open_at(&self.path, at)?)
     }
 
     /// Get the latest timestamp in the store.
@@ -166,12 +210,15 @@ where
 
     /// Iterate over facts starting from a specific timestamp.
     ///
-    /// This efficiently seeks to the first fact at or after the given timestamp.
+    /// Yields facts from the first one at or after `since`. This is a
+    /// time-travel query, not a sync cursor: a whole batch shares one
+    /// timestamp, so resuming from the last timestamp seen re-delivers it.
+    /// To sync incrementally, keep a [`StreamPosition`] and use
+    /// [`read_at`](Self::read_at) instead.
     ///
     /// # Performance
     ///
-    /// Currently performs a linear scan from the start. For large fact streams,
-    /// consider adding an index file for faster seeking.
+    /// Performs a linear scan from the start of the stream.
     pub fn iter_from(&self, since: DateTime<Utc>) -> FactIterator<E, V, S> {
         FactIterator::new(self.path.clone(), since)
     }
@@ -446,6 +493,74 @@ mod tests {
             let read_facts: Vec<_> = store.iter().collect();
             assert_eq!(read_facts.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_append_returns_positions_and_read_at_resumes() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        let facts = create_test_facts();
+
+        let after_first = store.append(facts[0].clone()).unwrap();
+        let after_rest = store.append_batch(&facts[1..]).unwrap();
+        assert!(after_first < after_rest);
+        assert_eq!(
+            after_rest,
+            StreamPosition::from_offset(std::fs::metadata(temp.path()).unwrap().len())
+        );
+
+        let resumed: Vec<_> = store
+            .read_at(after_first)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(resumed, facts[1..]);
+
+        let mut reader = store.read_at(StreamPosition::START).unwrap();
+        let all: Vec<_> = reader.by_ref().collect::<Result<_, _>>().unwrap();
+        assert_eq!(all, facts);
+        assert_eq!(reader.position(), after_rest);
+
+        assert!(store.read_at(after_rest).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn test_empty_append_batch_returns_current_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(dir.path().join("facts.stream")).unwrap();
+
+        assert_eq!(store.append_batch(&[]).unwrap(), StreamPosition::START);
+        let after = store.append_batch(&create_test_facts()).unwrap();
+        assert_eq!(store.append_batch(&[]).unwrap(), after);
+    }
+
+    #[test]
+    fn test_read_at_on_store_without_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(dir.path().join("facts.stream")).unwrap();
+
+        assert!(store
+            .read_at(StreamPosition::START)
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn test_read_at_invalid_position_is_a_read_error() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: FactStore<String, TestValue, String> =
+            FactStore::open_or_create(temp.path()).unwrap();
+        store.append_batch(&create_test_facts()).unwrap();
+
+        let result = store.read_at(StreamPosition::from_offset(1));
+        assert!(matches!(
+            result,
+            Err(StoreError::Read(ReadError::InvalidPosition(_)))
+        ));
     }
 
     #[test]

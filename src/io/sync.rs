@@ -1,17 +1,16 @@
 // stainless_facts/src/io/sync.rs
 
 use super::{common, ReadError, WriteError};
-use crate::Fact;
+use crate::{Fact, StreamPosition};
 use fs2::FileExt;
 use serde::{de::DeserializeOwned, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub struct FactStreamWriter {
     file: File,
-    writer: BufWriter<File>,
     lock_timeout: Duration,
 }
 
@@ -30,10 +29,8 @@ impl FactStreamWriter {
         timeout: Duration,
     ) -> Result<Self, WriteError> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let writer = BufWriter::new(file.try_clone()?);
         Ok(Self {
             file,
-            writer,
             lock_timeout: timeout,
         })
     }
@@ -63,8 +60,17 @@ impl FactStreamWriter {
     ///
     /// Acquires exclusive lock, writes all facts, then releases lock.
     /// All facts are serialized to memory first. If serialization fails,
-    /// no facts are written. After successful write, fsync ensures durability.
-    pub fn write_batch<E, V, S>(&mut self, facts: &[Fact<E, V, S>]) -> Result<(), WriteError>
+    /// no facts are written. The batch is appended with a single write, and
+    /// fsync ensures durability.
+    ///
+    /// Returns the position just past the last written line, taken under
+    /// the write lock: the end of the stream once this batch is on disk.
+    /// Reading from it (with [`FactStreamReader::open_at`]) yields exactly
+    /// the facts written after this batch.
+    pub fn write_batch<E, V, S>(
+        &mut self,
+        facts: &[Fact<E, V, S>],
+    ) -> Result<StreamPosition, WriteError>
     where
         E: Serialize,
         V: Serialize,
@@ -76,10 +82,9 @@ impl FactStreamWriter {
         self.acquire_lock()?;
 
         let result = (|| {
-            self.writer.write_all(&buffer)?;
-            self.writer.flush()?;
+            self.file.write_all(&buffer)?;
             self.file.sync_all()?;
-            Ok(())
+            Ok(StreamPosition::from_offset(self.file.metadata()?.len()))
         })();
 
         // Always release lock, even on error
@@ -89,21 +94,139 @@ impl FactStreamWriter {
     }
 }
 
-pub struct FactStreamReader<E, V, S> {
+/// Check that `at` is a line boundary of `file` and leave the file's cursor
+/// there.
+///
+/// A position is valid if it is within the file and is either the start or
+/// directly follows a `'\n'`.
+fn seek_to_line_boundary(file: &mut File, at: StreamPosition) -> Result<(), ReadError> {
+    let offset = at.offset();
+    if offset > file.metadata()?.len() {
+        return Err(ReadError::InvalidPosition(at));
+    }
+    if offset == 0 {
+        file.seek(SeekFrom::Start(0))?;
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(offset - 1))?;
+    let mut previous = [0u8];
+    file.read_exact(&mut previous)?;
+    if previous[0] != b'\n' {
+        return Err(ReadError::InvalidPosition(at));
+    }
+    Ok(())
+}
+
+/// Reads complete (newline-terminated) lines and tracks the position after
+/// the last one.
+///
+/// A trailing line without `'\n'` may still be being written, so it is kept
+/// in `buf` without advancing `pos`. The next call continues reading into
+/// the same buffer. Whitespace-only lines are skipped, but `pos` still
+/// advances past them. I/O errors do not advance `pos`.
+struct LineCursor {
     reader: BufReader<File>,
+    /// The line being read: a complete line (ending in `'\n'`) that was
+    /// returned by the last call, or a partial line still waiting for its
+    /// newline.
+    buf: Vec<u8>,
+    /// Offset just past the last complete line consumed.
+    pos: u64,
+}
+
+impl LineCursor {
+    /// Start reading `file` at `at`, which is checked to be a line boundary.
+    fn open_at(mut file: File, at: StreamPosition) -> Result<Self, ReadError> {
+        seek_to_line_boundary(&mut file, at)?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            buf: Vec::new(),
+            pos: at.offset(),
+        })
+    }
+
+    fn position(&self) -> StreamPosition {
+        StreamPosition::from_offset(self.pos)
+    }
+
+    /// The next complete, non-blank line, including its `'\n'`.
+    ///
+    /// `None` means no complete line is available yet. More may become
+    /// available once the writer appends, so calling again later can
+    /// return `Some`.
+    fn next_line(&mut self) -> Option<io::Result<&[u8]>> {
+        if self.buf.last() == Some(&b'\n') {
+            // Consumed by the previous call.
+            self.buf.clear();
+        }
+        loop {
+            match self.reader.read_until(b'\n', &mut self.buf) {
+                Err(e) => return Some(Err(e)),
+                // EOF, or a partial line still waiting for its newline.
+                Ok(_) if self.buf.last() != Some(&b'\n') => return None,
+                Ok(_) => {
+                    self.pos += self.buf.len() as u64;
+                    if self.buf.trim_ascii().is_empty() {
+                        self.buf.clear();
+                        continue;
+                    }
+                    return Some(Ok(&self.buf));
+                }
+            }
+        }
+    }
+}
+
+/// Reads facts from a fact stream file.
+///
+/// The reader yields only complete, newline-terminated lines: a trailing
+/// line without `'\n'` may still be being written, so it is neither yielded
+/// nor advanced past. Blank lines are skipped. A line that fails to decode
+/// is yielded as `Err` and skipped, so iteration can continue past it.
+///
+/// The iterator is **not fused**: after it returns `None` at the end of the
+/// stream, it returns `Some` again once more lines are appended. Calling
+/// [`next`](Iterator::next) again later tails the stream.
+///
+/// [`position`](Self::position) is where to resume reading later with
+/// [`open_at`](Self::open_at).
+pub struct FactStreamReader<E, V, S> {
+    cursor: LineCursor,
     _phantom: std::marker::PhantomData<(E, V, S)>,
 }
 
 impl<E, V, S> FactStreamReader<E, V, S> {
-    /// Open a fact stream file for reading.
+    /// Open a fact stream file for reading from the start.
     ///
-    /// Acquires a shared lock immediately or fails.
+    /// Acquires a shared lock immediately or fails. Equivalent to
+    /// [`open_at`](Self::open_at) with [`StreamPosition::START`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReadError> {
-        Self::open_with_timeout(path, Duration::from_secs(0))
+        Self::open_at(path, StreamPosition::START)
+    }
+
+    /// Open a fact stream file for reading, starting at `at`.
+    ///
+    /// `at` should be a position returned by this stream's writer or
+    /// reader. Acquires a shared lock immediately or fails.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::InvalidPosition`] if `at` is past the end of the file or
+    /// is not at the start of a line.
+    pub fn open_at(path: impl AsRef<Path>, at: StreamPosition) -> Result<Self, ReadError> {
+        Self::open_at_with_timeout(path, at, Duration::from_secs(0))
     }
 
     /// Open with a timeout for acquiring the lock.
     pub fn open_with_timeout(path: impl AsRef<Path>, timeout: Duration) -> Result<Self, ReadError> {
+        Self::open_at_with_timeout(path, StreamPosition::START, timeout)
+    }
+
+    fn open_at_with_timeout(
+        path: impl AsRef<Path>,
+        at: StreamPosition,
+        timeout: Duration,
+    ) -> Result<Self, ReadError> {
         let file = OpenOptions::new().read(true).open(path)?;
 
         let start = Instant::now();
@@ -112,9 +235,8 @@ impl<E, V, S> FactStreamReader<E, V, S> {
         loop {
             match FileExt::try_lock_shared(&file) {
                 Ok(()) => {
-                    let reader = BufReader::new(file);
                     return Ok(Self {
-                        reader,
+                        cursor: LineCursor::open_at(file, at)?,
                         _phantom: std::marker::PhantomData,
                     });
                 }
@@ -130,6 +252,15 @@ impl<E, V, S> FactStreamReader<E, V, S> {
             }
         }
     }
+
+    /// The position just past the last complete line consumed.
+    ///
+    /// Blank lines and lines that failed to decode count as consumed. At
+    /// the end of the stream this is the length of the file, unless the
+    /// file ends in an unterminated line.
+    pub fn position(&self) -> StreamPosition {
+        self.cursor.position()
+    }
 }
 
 impl<E, V, S> Iterator for FactStreamReader<E, V, S>
@@ -141,25 +272,45 @@ where
     type Item = Result<Fact<E, V, S>, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut line = String::new();
+        Some(match self.cursor.next_line()? {
+            Ok(line) => Fact::decode_bytes(line).map_err(ReadError::Deserialization),
+            Err(e) => Err(ReadError::Io(e)),
+        })
+    }
+}
 
-        loop {
-            line.clear();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => return None, // EOF
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue; // Skip empty lines
-                    }
-
-                    match Fact::from_line(trimmed) {
-                        Ok(fact) => return Some(Ok(fact)),
-                        Err(e) => return Some(Err(ReadError::Deserialization(e))),
-                    }
-                }
-                Err(e) => return Some(Err(ReadError::Io(e))),
-            }
+/// Read up to `limit` raw lines from a fact stream, starting at `at`.
+///
+/// This is a pass-through for relays that forward lines without decoding
+/// them. Lines are returned without their trailing `'\n'`. Blank lines are
+/// skipped and do not count toward `limit`. Only complete lines are
+/// returned: a trailing line without `'\n'` may still be being written, so
+/// it is left for a later call.
+///
+/// Returns the lines and the position to pass as `at` to read the next
+/// page. When no more complete lines are available, the lines are empty and
+/// the position is unchanged.
+///
+/// No lock is taken: the stream's writer appends each batch with a single
+/// write, and only complete lines are read.
+///
+/// # Errors
+///
+/// [`ReadError::InvalidPosition`] if `at` is past the end of the file or is
+/// not at the start of a line. A line that is not valid UTF-8 fails the
+/// whole call with an [`io::ErrorKind::InvalidData`] error.
+pub fn read_lines_at(
+    path: impl AsRef<Path>,
+    at: StreamPosition,
+    limit: usize,
+) -> Result<(Vec<String>, StreamPosition), ReadError> {
+    let mut cursor = LineCursor::open_at(File::open(path)?, at)?;
+    let mut lines = Vec::new();
+    while lines.len() < limit {
+        match cursor.next_line() {
+            None => break,
+            Some(line) => lines.push(common::line_to_string(line?)?),
         }
     }
+    Ok((lines, cursor.position()))
 }

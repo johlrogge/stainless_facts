@@ -3,8 +3,8 @@
 //
 // Add to: src/async_store.rs (new file)
 
-use crate::io::{AsyncFactStreamWriter, ReadError, WriteError};
-use crate::Fact;
+use crate::io::{AsyncFactStreamReader, AsyncFactStreamWriter, ReadError, WriteError};
+use crate::{Fact, StreamPosition};
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Serialize};
@@ -34,7 +34,8 @@ pub enum StoreError {
 ///
 /// The AsyncFactStore provides:
 /// - Thread-safe appending of facts with timestamp validation
-/// - Efficient async iteration from any timestamp
+/// - Resumable reads from a [`StreamPosition`] with [`read_at`](Self::read_at)
+/// - Async iteration from any timestamp
 /// - Read-write locking for concurrent access
 /// - Async file I/O with tokio
 ///
@@ -112,7 +113,10 @@ where
     }
 
     /// Append a single fact, enforcing timestamp ordering.
-    pub async fn append(&self, fact: Fact<E, V, S>) -> Result<(), StoreError> {
+    ///
+    /// Returns the position just past the written fact; see
+    /// [`append_batch`](Self::append_batch).
+    pub async fn append(&self, fact: Fact<E, V, S>) -> Result<StreamPosition, StoreError> {
         self.append_batch(&[fact]).await
     }
 
@@ -120,9 +124,21 @@ where
     ///
     /// All facts are written atomically. If any fact violates timestamp ordering,
     /// the entire batch is rejected.
-    pub async fn append_batch(&self, facts: &[Fact<E, V, S>]) -> Result<(), StoreError> {
+    ///
+    /// Returns the position just past the batch, as returned by
+    /// [`AsyncFactStreamWriter::write_batch`]. Pass it to
+    /// [`read_at`](Self::read_at) to read only what was appended later. An
+    /// empty batch writes nothing and returns the current end of the stream.
+    pub async fn append_batch(
+        &self,
+        facts: &[Fact<E, V, S>],
+    ) -> Result<StreamPosition, StoreError> {
         if facts.is_empty() {
-            return Ok(());
+            return match tokio::fs::metadata(&self.path).await {
+                Ok(metadata) => Ok(StreamPosition::from_offset(metadata.len())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StreamPosition::START),
+                Err(e) => Err(e.into()),
+            };
         }
 
         // Check timestamp ordering
@@ -141,7 +157,7 @@ where
 
         // Write facts (AsyncFactStreamWriter handles locking)
         let mut writer = AsyncFactStreamWriter::open(&self.path).await?;
-        writer.write_batch(facts).await?;
+        let position = writer.write_batch(facts).await?;
 
         // Update cached latest timestamp
         if let Some(last_fact) = facts.last() {
@@ -149,7 +165,33 @@ where
             *latest = Some(*last_fact.timestamp());
         }
 
-        Ok(())
+        Ok(position)
+    }
+
+    /// Read the facts after position `at`.
+    ///
+    /// The async twin of [`FactStore::read_at`](crate::FactStore::read_at):
+    /// `at` is a position returned by [`append`](Self::append),
+    /// [`append_batch`](Self::append_batch) or a reader's
+    /// [`position`](AsyncFactStreamReader::position), or
+    /// [`StreamPosition::START`]. Every fact after it is delivered exactly
+    /// once. If the store's file does not exist yet, it is created empty.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::Read` with [`ReadError::InvalidPosition`] if `at` is
+    /// past the end of the stream or not at the start of a line.
+    pub async fn read_at(
+        &self,
+        at: StreamPosition,
+    ) -> Result<AsyncFactStreamReader<E, V, S>, StoreError> {
+        // Make sure the file exists, without touching its contents.
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        Ok(AsyncFactStreamReader::open_at(&self.path, at).await?)
     }
 
     /// Get the latest timestamp in the store.
@@ -164,12 +206,15 @@ where
 
     /// Iterate over facts starting from a specific timestamp.
     ///
-    /// This efficiently seeks to the first fact at or after the given timestamp.
+    /// Yields facts from the first one at or after `since`. This is a
+    /// time-travel query, not a sync cursor: a whole batch shares one
+    /// timestamp, so resuming from the last timestamp seen re-delivers it.
+    /// To sync incrementally, keep a [`StreamPosition`] and use
+    /// [`read_at`](Self::read_at) instead.
     ///
     /// # Performance
     ///
-    /// Currently performs a linear scan from the start. For large fact streams,
-    /// consider adding an index file for faster seeking.
+    /// Performs a linear scan from the start of the stream.
     pub async fn iter_from(&self, since: DateTime<Utc>) -> AsyncFactIterator<E, V, S> {
         AsyncFactIterator::new(self.path.clone(), since).await
     }
@@ -467,6 +512,84 @@ mod tests {
             }
             assert_eq!(read_facts.len(), 2);
         }
+    }
+
+    async fn collect_reader(
+        mut reader: crate::io::AsyncFactStreamReader<String, TestValue, String>,
+    ) -> Vec<Fact<String, TestValue, String>> {
+        let mut facts = Vec::new();
+        while let Some(result) = reader.next().await {
+            facts.push(result.unwrap());
+        }
+        facts
+    }
+
+    #[tokio::test]
+    async fn test_append_returns_positions_and_read_at_resumes() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        let facts = create_test_facts();
+
+        let after_first = store.append(facts[0].clone()).await.unwrap();
+        let after_rest = store.append_batch(&facts[1..]).await.unwrap();
+        assert!(after_first < after_rest);
+        assert_eq!(
+            after_rest,
+            StreamPosition::from_offset(std::fs::metadata(temp.path()).unwrap().len())
+        );
+
+        let resumed = collect_reader(store.read_at(after_first).await.unwrap()).await;
+        assert_eq!(resumed, facts[1..]);
+
+        let all = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+        assert_eq!(all, facts);
+
+        let mut at_end = store.read_at(after_rest).await.unwrap();
+        assert!(at_end.next().await.is_none());
+        assert_eq!(at_end.position(), after_rest);
+    }
+
+    #[tokio::test]
+    async fn test_empty_append_batch_returns_current_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(dir.path().join("facts.stream"))
+                .await
+                .unwrap();
+
+        assert_eq!(
+            store.append_batch(&[]).await.unwrap(),
+            StreamPosition::START
+        );
+        let after = store.append_batch(&create_test_facts()).await.unwrap();
+        assert_eq!(store.append_batch(&[]).await.unwrap(), after);
+    }
+
+    #[tokio::test]
+    async fn test_read_at_on_store_without_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(dir.path().join("facts.stream"))
+                .await
+                .unwrap();
+
+        let facts = collect_reader(store.read_at(StreamPosition::START).await.unwrap()).await;
+        assert!(facts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_at_invalid_position_is_a_read_error() {
+        let temp = NamedTempFile::new().unwrap();
+        let store: AsyncFactStore<String, TestValue, String> =
+            AsyncFactStore::open_or_create(temp.path()).await.unwrap();
+        store.append_batch(&create_test_facts()).await.unwrap();
+
+        let result = store.read_at(StreamPosition::from_offset(1)).await;
+        assert!(matches!(
+            result,
+            Err(StoreError::Read(ReadError::InvalidPosition(_)))
+        ));
     }
 
     #[tokio::test]
