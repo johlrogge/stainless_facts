@@ -1,6 +1,6 @@
 [package]
 name = "stainless-facts"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["Joakim Ohlrogge"]
 license = "MIT OR Apache-2.0"
