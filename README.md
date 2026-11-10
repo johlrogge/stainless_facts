@@ -42,23 +42,23 @@ Enable additional features as needed:
 # Cargo.toml
 
 # Core only (no file I/O)
-stainless-facts = "0.2"
+stainless-facts = "0.3"
 
 # With synchronous I/O
-stainless-facts = { version = "0.2", features = ["io"] }
+stainless-facts = { version = "0.3", features = ["io"] }
 
 # With async I/O
-stainless-facts = { version = "0.2", features = ["tokio"] }
+stainless-facts = { version = "0.3", features = ["tokio"] }
 ```
 
 ## Installation
 
 ```toml
 [dependencies]
-stainless-facts = "0.2"
+stainless-facts = "0.3"
 
 # To use FactStore or the stream reader/writer:
-# stainless-facts = { version = "0.2", features = ["io"] }
+# stainless-facts = { version = "0.3", features = ["io"] }
 ```
 
 ## Serialization Contract
@@ -163,11 +163,20 @@ impl FactAggregator<String, MusicValue, String> for Track {
         }
     }
 
-    fn retract(&mut self, value: &MusicValue, _source: &String) {
+    fn retract(&mut self, value: &MusicValue, _retracted_by: &String) {
         match value {
             MusicValue::Tag(tag) => self.tags.retain(|t| t != tag),
-            MusicValue::Bpm(_) => self.bpm = None,
-            MusicValue::Title(_) => self.title = None,
+            // Clear only when the retracted value is the current one
+            MusicValue::Bpm(bpm) => {
+                if self.bpm == Some(*bpm) {
+                    self.bpm = None;
+                }
+            }
+            MusicValue::Title(title) => {
+                if self.title.as_ref() == Some(title) {
+                    self.title = None;
+                }
+            }
         }
     }
 }
@@ -199,7 +208,7 @@ fn main() {
 
 ## Using FactStore
 
-`FactStore` requires the `io` feature (`stainless-facts = { version = "0.2", features = ["io"] }`), as do the examples in this section and the sync and thread-safety sections below; only the line codec works without it. It provides persistent, thread-safe fact storage with incremental synchronization:
+`FactStore` requires the `io` feature (`stainless-facts = { version = "0.3", features = ["io"] }`), as do the examples in this section and the sync and thread-safety sections below; only the line codec works without it. It provides persistent, thread-safe fact storage with incremental synchronization:
 
 ```rust
 use stainless_facts::{Fact, FactStore, Operation};
@@ -459,7 +468,7 @@ fn assert(&mut self, value: &MusicValue, _source: &String) {
     }
 }
 
-fn retract(&mut self, value: &MusicValue, _source: &String) {
+fn retract(&mut self, value: &MusicValue, _retracted_by: &String) {
     match value {
         MusicValue::Tag(tag) => {
             self.tags.retain(|t| t != tag);  // Removes specific value
@@ -468,6 +477,40 @@ fn retract(&mut self, value: &MusicValue, _source: &String) {
     }
 }
 ```
+
+## Retraction semantics
+
+A retract is matched by value, never by timestamp or source. The rule (see [ADR-001](docs/adr/001-retraction-identity-and-occurrence-modelling.md)):
+
+> Identity of an assertion is (entity, value), where value is the whole tagged attribute `{t, v}`, compared with `V: Eq`. A value `v` is live on entity `e` iff the last fact on `(e, v)` in log order is an Assert.
+> - A Retract cancels the live `(e, v)` if there is one; otherwise it is a no-op, not an error.
+> - Asserting an already-live `(e, v)` is redundant for liveness. There is never more than one live copy, so one Retract always removes it.
+> - A fact's timestamp and source describe *that line*: when it was recorded and by whom. On a Retract they describe the retraction, never the assertion it cancels. They are never part of matching.
+> - `V`'s `Eq` is the retract identity, so it must be structural. Payloads that aren't `Eq` (e.g. floats with NaN) are unsuitable for retractable attributes. For unknown attributes, identity is `UnknownAttribute` equality (`t` plus JSON `v`). Note that JSON `1` and `1.0` differ.
+
+The `retracted_by` parameter of `FactAggregator::retract` is the provenance of the retraction, not a match key. The folds only dispatch facts to your aggregator and do not enforce the rule; your `retract` implements it (a reference implementation, `LiveSet`, is planned for 0.4.0).
+
+### Alignment with Datomic
+
+This follows Datomic on E/A/V identity, redundant re-asserts, redundant retracts, a retraction carrying the retracting transaction's time, and keeping provenance out of identity.
+
+One deliberate departure: **cardinality-one is a view, not a write-time constraint.** Stainless writes no implicit retract. For a single-valued attribute, "current" is the most recent live value, so retracting it falls back to the previous live value (retracting a user BPM override restores the scanned BPM). To replace a value, write `Retract(old)` and `Assert(new)` in one batch. The live set of a frequently edited scalar grows until old values are retracted.
+
+### Model occurrences as distinct values
+
+Two equal asserts are one live value, so repeated events (plays) cannot be retracted individually. Give each occurrence its own identity inside the value, using an id minted by the writer (e.g. a ULID/UUIDv7; stainless does not depend on `ulid`):
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "t", content = "v")]
+enum MusicValue {
+    // `PlayId` is any Eq id type, e.g. a ULID/UUIDv7 minted by the writer
+    Played { play: PlayId, started_at: DateTime<Utc> },
+    // ...
+}
+```
+
+Domain time (`started_at`) lives in the value; the fact's timestamp is record time. Retracting that exact value removes that one play, and a UI can list the live values, each carrying its id. Use a separate entity (`Play(id)` with its own attributes) only when a play has several independently retractable attributes.
 
 ## Design Principles
 

@@ -198,12 +198,49 @@ impl<'de, V: DeserializeOwned> Deserialize<'de> for Attr<V> {
 pub type OpenFact<E, V, S> = Fact<E, Attr<V>, S>;
 
 /// Trait for aggregating facts into domain-specific data structures.
+///
+/// # Retraction semantics
+///
+/// The canonical rule for what a Retract means:
+///
+/// > Identity of an assertion is (entity, value), where value is the whole
+/// > tagged attribute `{t, v}`, compared with `V: Eq`. A value `v` is live on
+/// > entity `e` iff the last fact on `(e, v)` in log order is an Assert.
+/// > - A Retract cancels the live `(e, v)` if there is one; otherwise it is a
+/// >   no-op, not an error.
+/// > - Asserting an already-live `(e, v)` is redundant for liveness. There is
+/// >   never more than one live copy, so one Retract always removes it.
+/// > - A fact's timestamp and source describe *that line*: when it was
+/// >   recorded and by whom. On a Retract they describe the retraction, never
+/// >   the assertion it cancels. They are never part of matching.
+/// > - `V`'s `Eq` is the retract identity, so it must be structural. Payloads
+/// >   that aren't `Eq` (e.g. floats with NaN) are unsuitable for retractable
+/// >   attributes. For unknown attributes, identity is `UnknownAttribute`
+/// >   equality (`t` plus JSON `v`). Note that JSON `1` and `1.0` differ.
+///
+/// The fold functions do not enforce this rule. They are mechanism-only:
+/// they dispatch each fact to the aggregate and leave matching to it, so
+/// existing aggregators and logs fold unchanged. Aggregators should follow
+/// the rule.
+///
+/// Occurrences that can repeat with equal content, such as plays, should be
+/// modelled as distinct values: put a writer-minted id (e.g. a ULID or
+/// UUIDv7) inside the value, so each occurrence can be retracted by value on
+/// its own.
+///
+/// See ADR-001 in the repository:
+/// docs/adr/001-retraction-identity-and-occurrence-modelling.md
 pub trait FactAggregator<E, V, S> {
     /// Handle an assertion fact.
     fn assert(&mut self, value: &V, source: &S);
 
     /// Handle a retraction fact.
-    fn retract(&mut self, value: &V, source: &S);
+    ///
+    /// `value` is the value to retract: by the rule in
+    /// [Retraction semantics](FactAggregator#retraction-semantics) it cancels
+    /// the live value equal to it, if any. `retracted_by` is the provenance of
+    /// the retraction, not a match key.
+    fn retract(&mut self, value: &V, retracted_by: &S);
 
     /// Apply a single fact to this aggregator.
     ///
@@ -232,7 +269,10 @@ pub trait FactAggregator<E, V, S> {
     fn assert_unknown(&mut self, _attribute: &str, _value: &JsonValue, _source: &S) {}
 
     /// Handle an unknown retraction.
-    fn retract_unknown(&mut self, _attribute: &str, _value: &JsonValue, _source: &S) {}
+    ///
+    /// Identity is the attribute `t` plus its JSON `v`. `retracted_by` is the
+    /// provenance of the retraction, not a match key.
+    fn retract_unknown(&mut self, _attribute: &str, _value: &JsonValue, _retracted_by: &S) {}
 
     /// Apply a single fact whose attribute this reader could not decode.
     ///
@@ -399,8 +439,12 @@ where
 ///         let Track::Title(title) = value;
 ///         self.title = Some(title.clone());
 ///     }
-///     fn retract(&mut self, _value: &Track, _source: &String) {
-///         self.title = None;
+///     fn retract(&mut self, value: &Track, _retracted_by: &String) {
+///         // Clear only if the retracted value is the current one.
+///         let Track::Title(title) = value;
+///         if self.title.as_ref() == Some(title) {
+///             self.title = None;
+///         }
 ///     }
 ///     fn assert_unknown(&mut self, attribute: &str, value: &Value, _source: &String) {
 ///         self.unknown.push((attribute.to_owned(), value.clone()));
@@ -665,7 +709,7 @@ mod tests {
             self.0.push(title.clone());
         }
 
-        fn retract(&mut self, value: &TestValue, _source: &String) {
+        fn retract(&mut self, value: &TestValue, _retracted_by: &String) {
             let TestValue::Title(title) = value;
             self.0.retain(|t| t != title);
         }
@@ -720,7 +764,7 @@ mod tests {
             panic!("apply override should bypass assert");
         }
 
-        fn retract(&mut self, _value: &TestValue, _source: &String) {
+        fn retract(&mut self, _value: &TestValue, _retracted_by: &String) {
             panic!("apply override should bypass retract");
         }
 
@@ -947,7 +991,7 @@ mod tests {
             self.titles.push(title.clone());
         }
 
-        fn retract(&mut self, value: &TestValue, _source: &String) {
+        fn retract(&mut self, value: &TestValue, _retracted_by: &String) {
             let TestValue::Title(title) = value;
             self.titles.retain(|t| t != title);
         }
@@ -1078,7 +1122,7 @@ mod tests {
             fn assert(&mut self, _value: &TestValue, _source: &String) {
                 self.0 += 1;
             }
-            fn retract(&mut self, _value: &TestValue, _source: &String) {
+            fn retract(&mut self, _value: &TestValue, _retracted_by: &String) {
                 self.0 = self.0.saturating_sub(1);
             }
             fn is_retired(&self) -> bool {
@@ -1108,7 +1152,7 @@ mod tests {
         fn assert(&mut self, _value: &TestValue, _source: &String) {
             self.0 += 1;
         }
-        fn retract(&mut self, _value: &TestValue, _source: &String) {}
+        fn retract(&mut self, _value: &TestValue, _retracted_by: &String) {}
         fn is_retired(&self) -> bool {
             true
         }
@@ -1172,7 +1216,7 @@ mod tests {
                 self.live += 1;
             }
 
-            fn retract(&mut self, value: &Song, _source: &String) {
+            fn retract(&mut self, value: &Song, _retracted_by: &String) {
                 self.seen
                     .push(Seen::Known(Operation::Retract, value.clone()));
                 self.live -= 1;
@@ -1188,12 +1232,17 @@ mod tests {
                 self.live += 1;
             }
 
-            fn retract_unknown(&mut self, attribute: &str, value: &JsonValue, source: &String) {
+            fn retract_unknown(
+                &mut self,
+                attribute: &str,
+                value: &JsonValue,
+                retracted_by: &String,
+            ) {
                 self.seen.push(Seen::Unknown(
                     Operation::Retract,
                     attribute.to_owned(),
                     value.clone(),
-                    source.clone(),
+                    retracted_by.clone(),
                 ));
                 self.live -= 1;
             }
@@ -1208,16 +1257,21 @@ mod tests {
                 self.0.assert(value, source);
             }
 
-            fn retract(&mut self, value: &Song, source: &String) {
-                self.0.retract(value, source);
+            fn retract(&mut self, value: &Song, retracted_by: &String) {
+                self.0.retract(value, retracted_by);
             }
 
             fn assert_unknown(&mut self, attribute: &str, value: &JsonValue, source: &String) {
                 self.0.assert_unknown(attribute, value, source);
             }
 
-            fn retract_unknown(&mut self, attribute: &str, value: &JsonValue, source: &String) {
-                self.0.retract_unknown(attribute, value, source);
+            fn retract_unknown(
+                &mut self,
+                attribute: &str,
+                value: &JsonValue,
+                retracted_by: &String,
+            ) {
+                self.0.retract_unknown(attribute, value, retracted_by);
             }
 
             fn is_retired(&self) -> bool {
@@ -1326,7 +1380,7 @@ mod tests {
             struct Stamps(Vec<(String, i64, Operation)>);
             impl FactAggregator<String, Song, String> for Stamps {
                 fn assert(&mut self, _value: &Song, _source: &String) {}
-                fn retract(&mut self, _value: &Song, _source: &String) {}
+                fn retract(&mut self, _value: &Song, _retracted_by: &String) {}
                 fn apply_unknown(&mut self, fact: &Fact<String, UnknownAttribute, String>) {
                     self.0.push((
                         fact.entity().clone(),

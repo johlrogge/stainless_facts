@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documented
+- The canonical retraction rule: identity is (entity, value), a Retract cancels the equal live value or is a no-op, and timestamp and source are never part of matching (ADR-001, `docs/adr/001-retraction-identity-and-occurrence-modelling.md`; README "Retraction semantics")
+- The `source` parameter of `FactAggregator::retract` and `retract_unknown` is renamed `retracted_by`: the provenance of the retraction, not a match key. Docs only, not breaking (parameter names are not API)
+
+### Fixed
+- Examples (README Quick Start, `aggregate_open_facts_into` doctest) cleared a single-valued field on any retract of the attribute; they now clear only when the retracted value equals the current one
+- README install snippets said `0.2`; they now say `0.3`
+
 ## [0.3.0] - 2026-11-03
 
 ### Added
